@@ -3,6 +3,16 @@ from abc import ABC, abstractmethod
 import numpy as np
 import scipy as sc
 
+def get_categorical_dist(n_category, seed_category_idx, p_mutation):
+    dist_c = (p_mutation / (n_category - 1)) * np.ones([n_category])
+    dist_c[seed_category_idx] = 1 - p_mutation
+    return dist_c
+
+def get_mutant(seq, p, alphabet):
+    token2dist = {token: get_categorical_dist(len(alphabet), i, p) for i, token in enumerate(alphabet)}
+    alphabet_list = list(alphabet)
+    return ''.join([np.random.choice(alphabet_list, p=token2dist[token]) for token in seq])
+
 
 class DistributionShift(ABC):
     def __init__(self, d: int):
@@ -16,9 +26,10 @@ class DistributionShift(ABC):
     def get_log_dr(self, X_nxd: np.array):
         raise NotImplementedError
 
+
 class DiscreteSequences(DistributionShift):
     def __init__(self, d, p: float = 0.1):
-        self.d = d
+        super().__init__(d)
         self.p = p
         self.logp = np.log(p)
         self.log1minp = np.log(1 - p)

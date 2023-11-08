@@ -1,6 +1,10 @@
 import copy
 from time import time
+from typing import Iterator
+from itertools import chain
 
+
+from torch.nn import Parameter
 from tqdm import tqdm
 
 import numpy as np
@@ -56,7 +60,7 @@ def get_mixed_dim_waymarks(X0_nxd, Xm_nxd, n_ratio):
         Xmsamp_nxd = Xm_nxd[i_mxnx2[k - 1, :, 1]]
 
         X_m1xnxd[k] = np.hstack(
-            [X0samp_nxd[:, : k * chunk_sz], Xmsamp_nxd[:, k * chunk_sz :]]
+            [Xmsamp_nxd[:, : k * chunk_sz], X0samp_nxd[:, k * chunk_sz :]]
         )
         print('Waymark {} / {} has {}, {} dimensions from P0, Pm.'.format(
             k, n_ratio - 1, np.fmin(k * chunk_sz, d), np.fmax(0, d - k * chunk_sz)
@@ -74,6 +78,69 @@ class Linear(torch.nn.Module):
 
     def forward(self, X_nxd: np.array):
         return self.b + torch.matmul(X_nxd, self.a)
+
+
+class FeedForward(torch.nn.Module):
+    def __init__(self, in_size, n_hidden: int = 64):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(in_size, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1),
+        )
+
+    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        return self.model.parameters()
+
+    def forward(self, X_nxd):
+        return self.model(X_nxd)
+
+
+class MixedDimensionsClassifier(torch.nn.Module):
+    def __init__(self, seq_len, alphabet_sz, k, n_ratio, n_hidden):
+        super().__init__()
+        self.k = k
+        self.n_ratio = n_ratio
+        self.alphabet_sz = alphabet_sz
+        self.seq_len = seq_len
+        if k:
+            self.modelpm = nn.Sequential(
+                nn.Linear(k * alphabet_sz, n_hidden),
+                nn.ReLU(),
+                nn.Linear(n_hidden, n_hidden),
+                nn.ReLU(),
+                nn.Linear(n_hidden, alphabet_sz),
+                nn.Threshold(0, 0)
+            )
+        else:
+            self.pmlogprob_1xa = torch.nn.Parameter(-torch.rand(1, alphabet_sz))
+        if k < n_ratio - 1:
+            self.modelp0 = nn.Sequential(
+                nn.Linear((seq_len - (k + 1)) * alphabet_sz, n_hidden),
+                nn.ReLU(),
+                nn.Linear(n_hidden, n_hidden),
+                nn.ReLU(),
+                nn.Linear(n_hidden, alphabet_sz),
+                nn.Threshold(0, 0)
+            )
+        else:
+            self.p0logprob_1xa = torch.nn.Parameter(-torch.rand(1, alphabet_sz))
+
+    def forward(self, X_nxd):
+        assert(X_nxd.shape[1] == self.seq_len * self.alphabet_sz)
+        if self.k:
+            comppm_xa = self.modelpm(X_nxd[:, : self.k * self.alphabet_sz])
+        else:
+            comppm_xa = self.pmlogprob_1xa
+        if self.k < self.n_ratio - 1:
+            compp0_xa = self.modelp0(X_nxd[:, (self.k + 1) * self.alphabet_sz :])
+        else:
+            compp0_xa = self.p0logprob_1xa
+
+        X_nxa = X_nxd[:, self.k * self.alphabet_sz : (self.k + 1) * self.alphabet_sz]
+        return torch.sum(X_nxa * (compp0_xa - comppm_xa), dim=1, keepdim=True)
 
 
 class Quadratic(torch.nn.Module):
@@ -113,10 +180,18 @@ class Quadratic(torch.nn.Module):
         return quad_nx1 + self.b + torch.matmul(X_nxd, self.a)
 
 
+
 class UnsharedTelescopingLogDensityRatioEstimator(nn.Module):
-    def __init__(self, model_class, in_size: int, n_ratio: int = 1, device = None, dtype = None):
+    def __init__(self, model_class, in_size: int, n_ratio: int = 1, device = None, dtype = None,
+                 use_mixeddimclassifier: bool = False, n_hidden: int = 32):
         super().__init__()
-        self.bridges = nn.ModuleList([model_class(in_size) for _ in range(n_ratio)])
+        if use_mixeddimclassifier:
+            print('n_ratio must be the sequence length! ')
+            self.bridges = nn.ModuleList(
+                [MixedDimensionsClassifier(n_ratio, 4, k, n_ratio, n_hidden) for k in range(n_ratio)]
+            )
+        else:
+            self.bridges = nn.ModuleList([model_class(in_size) for _ in range(n_ratio)])
         for b in self.bridges:
             b.to(device=device, dtype=dtype)
         self.in_size = in_size
@@ -216,4 +291,16 @@ class UnsharedTelescopingLogDensityRatioEstimator(nn.Module):
         tX_nxp = torch.from_numpy(X_nxp).to(device=self.device, dtype=self.dtype)
         ldre_nx1 = self(tX_nxp).cpu().detach().numpy()
         return ldre_nx1.squeeze(-1)
+
+    def forecast_meany(self, Xm_nxp, ym_n, use_logsumexp: bool = True):
+        # self-normalized estimate, as suggested by Grover et al. (2019) results
+        logdr_n = self.predict_log_dr(Xm_nxp)
+        if use_logsumexp:
+            c = np.max(logdr_n)
+            normalization = c + np.log(np.sum(np.exp(logdr_n - c)))
+            normalizeddr_n = np.exp(logdr_n - normalization)
+            return np.sum(normalizeddr_n * ym_n)
+        else:
+            dr_n = np.exp(logdr_n)
+            return np.sum(dr_n * ym_n) / np.sum(dr_n)
 
