@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from time import time
 from pathlib import Path
+import os.path
+
 from parse import parse
 
 import numpy as np
@@ -76,6 +78,7 @@ class FLEXSShift(object):
 
                 # run design algorithm
                 testseqs_n, predtest_n = self.explorer.propose_sequences(train_data)
+                assert(len(testseqs_n) == n)
                 ytest_n = self.landscape.get_fitness(testseqs_n)
                 noise = sc.stats.norm.rvs(loc=0, scale=self.noise_sd, size=len(testseqs_n)) # TODO HERE: clean up FLEXS
                 ytest_n = ytest_n + noise
@@ -83,9 +86,9 @@ class FLEXSShift(object):
         
                 if save_fname_prefix is not None:
                     
-                    fname = '{}-seed{}-n{}-{}{}.npz'.format(
-                        save_fname_prefix, seed_idx, n, name, val
-                    )
+                    fname = os.path.join(save_fname_prefix, 'seed{}-n{}-nmut{}-{}{}.npz'.format(
+                        seed_idx, n, avg_n_mut, name, val))
+                    
                     np.savez(
                         fname,
                         yseed=yseed,
@@ -106,8 +109,18 @@ class FLEXSShift(object):
         pass
 
 
-def generate_rna_data(model_class, explorer_class, explorer_kwarg_name2vals, save_fname_dir: str, noise_sd: float = .0,
-                      model_kwargs = None, seq_len: int = 50, landscape_names = None, ns = None, avg_n_mut: int = 3):
+def generate_rna_data(model_class,
+                      explorer_class,
+                      explorer_kwarg_name2vals,
+                      save_fname_dir: str,
+                      noise_sd: float = .0,
+                      n_trial: int = 1,
+                      model_kwargs = None,
+                      seq_len: int = 50,
+                      seed_idxs = None,
+                      landscape_names = None,
+                      ns = None,
+                      avg_n_muts = None):
 
     if landscape_names is None:
         landscape_names = flexs.landscapes.rna.registry().keys()
@@ -120,34 +133,76 @@ def generate_rna_data(model_class, explorer_class, explorer_kwarg_name2vals, sav
     print('with the following amounts of training data:')
     print(ns)
 
-    for landscape_name in landscape_names:
+    if seed_idxs is None:
+        seed_idxs = flexsshift.problem['starts'].keys()
 
-        save_fname_prefix = '/data/wongfanc/dre-data/data/{}/{}'.format(save_fname_dir, landscape_name)
-        Path(save_fname_prefix).mkdir(parents=True, exist_ok=True)
+    if avg_n_muts is None:
+        avg_n_muts = [3]
+
+    for landscape_name in landscape_names:
 
         flexsshift = FLEXSShift(landscape_name, noise_sd=noise_sd)
 
         for n in ns:
             
-            for seed_idx in flexsshift.problem['starts'].keys():
+            for seed_idx in seed_idxs:
 
-                t0 = time() 
+                for avg_n_mut in avg_n_muts:
 
-                _ = flexsshift.get_data(
-                    n,
-                    model_class,
-                    explorer_class,
-                    explorer_kwarg_name2vals,
-                    model_kwargs=model_kwargs,
-                    seed_idx=seed_idx,
-                    avg_n_mut=avg_n_mut,
-                    save_fname_prefix=save_fname_prefix
-                )    
-                print('Generated and saved data for {}, n = {}, seed {} ({} s).'.format(
-                    landscape_name, n, seed_idx, int(time() - t0)
-                ))
+                    for t in range(n_trial):
 
-def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_name2vals, save_fname_dir: str):
+                        save_fname_prefix = os.path.join(
+                            '/data/wongfanc/dre-data/data', save_fname_dir, landscape_name, 'trial{}'.format(t)
+                        )
+                        Path(save_fname_prefix).mkdir(parents=True, exist_ok=True)
+                        
+                        t0 = time()
+
+                        _ = flexsshift.get_data(
+                            n,
+                            model_class,
+                            explorer_class,
+                            explorer_kwarg_name2vals,
+                            model_kwargs=model_kwargs,
+                            seed_idx=seed_idx,
+                            avg_n_mut=avg_n_mut,
+                            save_fname_prefix=save_fname_prefix
+                        )    
+                        print('Generated and saved data for {}, n = {}, seed {}, avg. # train mutations {} ({} s).'.format(
+                            landscape_name, n, seed_idx, avg_n_mut, int(time() - t0)
+                        ))
+
+def process_getted_data(trainseqs_n, ytrain_n, calseqs_n, testseqs_list):
+    m = len(testseqs_list)
+    n = len(trainseqs_n)
+    seq_len = len(trainseqs_n[0])
+    d = seq_len * len(sutils.RNAA)
+
+    X_m1xnxd = np.zeros([m + 1, n, d])
+    y_m1xn = np.zeros([m + 1, n])
+    # slice i corresponds to i in X_m1xnxd. no predictions on training data
+    pred_mxn = np.zeros([m, n])
+
+    for k in range(m): 
+
+        testseqs_n, ytest_n, predtest_n = testseqs_list[k]
+
+        Xk_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in testseqs_n])
+        X_m1xnxd[k] = Xk_nxd
+        y_m1xn[k] = ytest_n
+        pred_mxn[k] = predtest_n  # no predictions on training data
+
+    # training data
+    Xm_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in trainseqs_n])
+    X_m1xnxd[-1] = Xm_nxd
+    y_m1xn[-1] = ytrain_n
+
+    # calibration data
+    Xcal_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in calseqs_n])
+
+    return X_m1xnxd, y_m1xn, pred_mxn, Xcal_nxd
+
+def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_name2vals, save_fname_dir: str, avg_n_mut: int, trial_idx: int):
     
     assert(len(explorer_kwarg_name2vals.keys()) == 1)
     hp_name = list(explorer_kwarg_name2vals.keys())[0]
@@ -165,13 +220,17 @@ def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_nam
     ycal_mxn = np.zeros([m, n])
     predcal_mxn = np.zeros([m, n])  # slice i corresponds to i in Xcal_mxnxd
 
-    save_fname_prefix = '{}/{}'.format(save_fname_dir, landscape_name)
     print('Loading waymarks in the following order for k = 0, 1, ..., m where k = 0 is the target design distribution.')
     print(hp_vals)
+    
     for k, val in enumerate(hp_vals):
 
-        fname = '{}-seed{}-n{}-{}{}.npz'.format(save_fname_prefix, seed_idx, n, hp_name, val)
-        loaded_dict = np.load(fname)
+        fname = 'seed{}-n{}-nmut{}-{}{}.npz'.format(seed_idx, n, avg_n_mut, hp_name, val)
+        save_fname = os.path.join(
+            '/data/wongfanc/dre-data/data', save_fname_dir, landscape_name, 'trial{}'.format(trial_idx), fname
+        )
+        print('Loading from {}'.format(save_fname))
+        loaded_dict = np.load(save_fname)
 
         # design data
         testseqs_n = loaded_dict['testseqs_n']
@@ -204,8 +263,7 @@ def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_nam
 
 
     # training sequences. could load from any hp_val, all the same training sequences
-    fname = '{}-seed{}-n{}-{}{}.npz'.format(save_fname_prefix, seed_idx, n, hp_name, hp_vals[0])
-    loaded_dict = np.load(fname)
+    loaded_dict = np.load(save_fname)
     trainseqs_n = loaded_dict['trainseqs_n']
     Xm_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in trainseqs_n])
     X_m1xnxd[-1] = Xm_nxd
