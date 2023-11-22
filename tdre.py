@@ -186,7 +186,7 @@ class UnsharedTelescopingLogDensityRatioEstimator(nn.Module):
                  use_mixeddimclassifier: bool = False, n_hidden: int = 32):
         super().__init__()
         if use_mixeddimclassifier:
-            print('n_ratio must be the sequence length! ')
+            print('n_ratio must be the sequence length!')
             self.bridges = nn.ModuleList(
                 [MixedDimensionsClassifier(n_ratio, 4, k, n_ratio, n_hidden) for k in range(n_ratio)]
             )
@@ -199,19 +199,27 @@ class UnsharedTelescopingLogDensityRatioEstimator(nn.Module):
         self.device = device
         self.dtype = dtype
 
-    def fit(self, X0_nxp: np.array, Xm_nxp: np.array, cfg):
+    def fit(self, cfg, X_m1xnxd: np.array = None, X0_nxp: np.array = None, Xm_nxp: np.array = None):
         # generate waymarks
-        if cfg['waymark_type'] == 'linear':
-            a_m1 = get_alphas(self.n_ratio)
-            X_m1xnxd = get_linear_waymarks(X0_nxp, Xm_nxp, a_m1)
-        elif cfg['waymark_type'] == 'mixed_dimensions':
-            X_m1xnxd = get_mixed_dim_waymarks(X0_nxp, Xm_nxp, self.n_ratio)
-        print('Generated {} waymarks.'.format(X_m1xnxd.shape[0] - 1))
+        if X_m1xnxd is None:
+            print('Generating waymarks.')
+            if cfg['waymark_type'] == 'linear':
+                a_m1 = get_alphas(self.n_ratio)
+                X_m1xnxd = get_linear_waymarks(X0_nxp, Xm_nxp, a_m1)
+            elif cfg['waymark_type'] == 'mixed_dimensions':
+                X_m1xnxd = get_mixed_dim_waymarks(X0_nxp, Xm_nxp, self.n_ratio)
+            print('Generated {} waymarks.'.format(X_m1xnxd.shape[0] - 1))
+        else:
+            print('{} waymarks provided'.format(X_m1xnxd.shape[0] - 1))
+            if X_m1xnxd.shape[0] - 1 != self.n_ratio:
+                raise ValueError('Number of provided waymarks {} must match n_ratio {}'.format(
+                    X_m1xnxd.shape[0], self.n_ratio
+                ))
 
         # train each bridge
         train_dfs = []
         t0 = time()
-        for i in range(self.n_ratio):  # TODO: parallelize
+        for i in range(self.n_ratio):
             df = self.fit_bridge(self.bridges[i], X_m1xnxd[i], X_m1xnxd[i + 1], cfg)
             print('Done fitting bridge {} / {} ({} s).'.format((i + 1), self.n_ratio, int(time() - t0)))
             train_dfs.append(df)
@@ -283,24 +291,38 @@ class UnsharedTelescopingLogDensityRatioEstimator(nn.Module):
         df = pd.DataFrame(ckpt_losses, columns=["train_loss", "val_loss"])
         return df
 
+    def _get_ldr_nxm(self, tX_nxp: torch.Tensor):
+        return torch.cat([self.bridges[i](tX_nxp) for i in range(self.n_ratio)], 1)
+
     def forward(self, tX_nxp: torch.Tensor):
-        ldre_nxm = torch.cat([self.bridges[i](tX_nxp) for i in range(self.n_ratio)], 1)
-        return torch.sum(ldre_nxm, 1, keepdim=True)
+        ldr_nxm = self._get_ldr_nxm(tX_nxp)
+        return torch.sum(ldr_nxm, 1, keepdim=True)
 
     def predict_log_dr(self, X_nxp: np.array):
         tX_nxp = torch.from_numpy(X_nxp).to(device=self.device, dtype=self.dtype)
         ldre_nx1 = self(tX_nxp).cpu().detach().numpy()
         return ldre_nx1.squeeze(-1)
 
-    def forecast_meany(self, Xm_nxp, ym_n, use_logsumexp: bool = True):
+    def forecast_meany(self, Xm_nxp, ym_n, predm_n: np.array = None, pred0_n: np.array = None):
         # self-normalized estimate, as suggested by Grover et al. (2019) results
         logdr_n = self.predict_log_dr(Xm_nxp)
-        if use_logsumexp:
-            c = np.max(logdr_n)
-            normalization = c + np.log(np.sum(np.exp(logdr_n - c)))
-            normalizeddr_n = np.exp(logdr_n - normalization)
+        # log-sum-exp trick
+        c = np.max(logdr_n)
+        normalization = c + np.log(np.sum(np.exp(logdr_n - c)))
+        normalizeddr_n = np.exp(logdr_n - normalization)
+        if predm_n is None or pred0_n is None:
             return np.sum(normalizeddr_n * ym_n)
-        else:
-            dr_n = np.exp(logdr_n)
-            return np.sum(dr_n * ym_n) / np.sum(dr_n)
+        return np.mean(pred0_n) - np.sum(normalizeddr_n * (predm_n - ym_n))
+    
+    def forecast_meany_per_bridge(self, Xm_nxp, ym_n):
+        tXm_nxp = torch.from_numpy(Xm_nxp).to(device=self.device, dtype=self.dtype)
+        ldr_nxm = self._get_ldr_nxm(tXm_nxp).cpu().detach().numpy()
+        # m = 0 corresponds to going to design distribution, so flip
+        ldr_nxm = np.cumsum(np.fliplr(ldr_nxm), axis=1)
+
+        c_1xm = np.max(ldr_nxm, axis=0, keepdims=True)
+        normalization_1xm = c_1xm + np.log(np.sum(np.exp(ldr_nxm - c_1xm), axis=0, keepdims=True))
+        normalizeddr_nxm = np.exp(ldr_nxm - normalization_1xm)
+        forecast_m = np.sum(normalizeddr_nxm * ym_n[:, None], axis=0, keepdims=False)
+        return forecast_m[::-1] # restore to m = 0 corresponding to design distribution
 

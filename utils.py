@@ -6,6 +6,9 @@ import flexs.utils.sequence_utils as s_utils
 
 import editdistance
 
+def rmse(x, y, axis=None):
+    return np.sqrt(np.mean(np.square(x - y), axis=axis))
+
 
 def plot_xy(x, y, s: int = 50, linewidth: float = 2, alpha: float = 0.8):
     plt.scatter(x, y, s=s, alpha=alpha)
@@ -40,6 +43,7 @@ def pairwise_distances(seqs1, seqs2, normalize: bool = True, n_pairs: int = 1000
     dists_between = np.array([editdistance.eval(s1, s2) for s1, s2 in zip(s1_n, s2_n)])
     dists_within1 = np.array([editdistance.eval(s12, s13) for s12, s13 in zip(s12_n, s13_n)])
     dists_within2 = np.array([editdistance.eval(s22, s23) for s22, s23 in zip(s22_n, s23_n)])
+    
     if normalize:
         l = len(seqs1[0])
         print('Normalizing by sequence length {}'.format(l))
