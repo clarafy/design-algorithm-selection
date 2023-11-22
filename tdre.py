@@ -314,15 +314,34 @@ class UnsharedTelescopingLogDensityRatioEstimator(nn.Module):
             return np.sum(normalizeddr_n * ym_n)
         return np.mean(pred0_n) - np.sum(normalizeddr_n * (predm_n - ym_n))
     
-    def forecast_meany_per_bridge(self, Xm_nxp, ym_n):
+    def forecast_meany_per_bridge(self, Xm_nxp, ym_n, predm_n: np.array = None, pred0_n: np.array = None, self_normalized: bool = True):
         tXm_nxp = torch.from_numpy(Xm_nxp).to(device=self.device, dtype=self.dtype)
         ldr_nxm = self._get_ldr_nxm(tXm_nxp).cpu().detach().numpy()
         # m = 0 corresponds to going to design distribution, so flip
-        ldr_nxm = np.cumsum(np.fliplr(ldr_nxm), axis=1)
+        ldr_nxm = np.fliplr(np.cumsum(np.fliplr(ldr_nxm), axis=1))
+        dr_nxm = np.exp(ldr_nxm)
+        
+        if self_normalized:
+            c_1xm = np.max(ldr_nxm, axis=0, keepdims=True)
+            normalization_1xm = c_1xm + np.log(np.sum(np.exp(ldr_nxm - c_1xm), axis=0, keepdims=True))
+            normalizeddr_nxm = np.exp(ldr_nxm - normalization_1xm)
+            # dr_nxm = dr_nxm / np.sum(dr_nxm, axis=0, keepdims=True)  # equivalent to normalizeddr_nxm
 
-        c_1xm = np.max(ldr_nxm, axis=0, keepdims=True)
-        normalization_1xm = c_1xm + np.log(np.sum(np.exp(ldr_nxm - c_1xm), axis=0, keepdims=True))
-        normalizeddr_nxm = np.exp(ldr_nxm - normalization_1xm)
-        forecast_m = np.sum(normalizeddr_nxm * ym_n[:, None], axis=0, keepdims=False)
-        return forecast_m[::-1] # restore to m = 0 corresponding to design distribution
+            if predm_n is None or pred0_n is None:
+                weightedym_nxm = normalizeddr_nxm * ym_n[:, None]
+                forecast_m = np.sum(weightedym_nxm, axis=0, keepdims=False)
+            else:
+                weightedrectm_nxm = normalizeddr_nxm * (predm_n - ym_n)[:, None]
+                forecast_m = np.mean(pred0_n) - np.sum(weightedrectm_nxm, axis=0, keepdims=False)
+        else:
+            if predm_n is None or pred0_n is None:
+                weightedym_nxm = dr_nxm * ym_n[:, None]
+                forecast_m = np.mean(weightedym_nxm, axis=0, keepdims=False)
+            else:
+                weightedrectm_nxm = dr_nxm *  (predm_n - ym_n)[:, None]
+                forecast_m = np.mean(pred0_n) - np.mean(weightedrectm_nxm, axis=0, keepdims=False)
+
+        return forecast_m, dr_nxm
+
+
 
