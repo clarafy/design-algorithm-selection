@@ -11,6 +11,7 @@ import pandas as pd
 
 import flexs
 import flexs.utils.sequence_utils as sutils
+from flexs.baselines.explorers import CbAS
 
 from shifts import DistributionShift, get_mutant
 
@@ -26,14 +27,16 @@ class FLEXSShift(object):
         # super().__init__(self.landscape.seq_length * len(self.alphabet))
 
 
-    def get_data(self, n: int, model_class, explorer_class, explorer_kwarg_name2vals, model_kwargs = None,
-                 save_fname_prefix: str = None, seed_idx: int = 1, avg_n_mut: int = 3):
+    def get_data(self, n: int, model_class, explorer: str, explorer_kwarg_name2vals, model_kwargs = None,
+                 N: int = None, save_fname_prefix: str = None, seed_idx: int = 1, n_cal: int = 1000, avg_n_mut: int = 3):
         if model_kwargs is None:
             model_kwargs = {}
         if model_class == flexs.baselines.models.LinearRegression or model_class == flexs.baselines.models.RidgeCV:
             model = model_class(alphabet=self.alphabet, **model_kwargs)
         else:
             model = model_class(self.landscape.seq_length, alphabet=self.alphabet, **model_kwargs)
+        if N is None:
+            N = n
 
         seed = self.problem['starts'][seed_idx]
         yseed = self.landscape.get_fitness([seed])[0]
@@ -42,12 +45,13 @@ class FLEXSShift(object):
         p_mut = avg_n_mut / self.landscape.seq_length
         trainseqs_n = [get_mutant(seed, p_mut, self.alphabet) for _ in range(n)]
         ytrain_n = self.landscape.get_fitness(trainseqs_n)
-        noise = sc.stats.norm.rvs(loc=0, scale=self.noise_sd, size=len(trainseqs_n)) # TODO HERE: clean up FLEXS
+        noise = sc.stats.norm.rvs(loc=0, scale=self.noise_sd, size=len(trainseqs_n)) # TODO: clean up FLEXS
         ytrain_n = ytrain_n + noise
-        calseqs_n = [get_mutant(seed, p_mut, self.alphabet) for _ in range(n)]
-        ycal_n = self.landscape.get_fitness(calseqs_n)
-        noise = sc.stats.norm.rvs(loc=0, scale=self.noise_sd, size=len(calseqs_n))
-        ycal_n = ycal_n + noise
+
+        trainseqs_n, calseqs_n = trainseqs_n[: n - n_cal], trainseqs_n[n - n_cal :]
+        ytrain_n, ycal_n = ytrain_n[: n - n_cal], ytrain_n[n - n_cal :]
+        assert(ytrain_n.size + ycal_n.size == n)        
+
         train_data = pd.DataFrame(
             {
                 "sequence": trainseqs_n,
@@ -62,30 +66,50 @@ class FLEXSShift(object):
         testseqs_list = []
         for name, vals in explorer_kwarg_name2vals.items():
             for val in vals:
-                self.explorer = explorer_class(
-                    model,
-                    **{name: val},
-                    starting_sequence=seed,
-                    rounds=1,
-                    sequences_batch_size=n,
-                    model_queries_per_batch=4 * n,  # TODO: ensure get n designs
-                    alphabet=self.alphabet
-                )
+                if explorer == 'adalead':
+                    self.explorer = flexs.baselines.explorers.Adalead(
+                        model,
+                        **{name: val},
+                        starting_sequence=seed,
+                        rounds=1,
+                        sequences_batch_size=N,
+                        model_queries_per_batch=5 * N,  # TODO: ensure get n designs
+                        alphabet=self.alphabet,
+                        eval_batch_size=1000
+                    )
+                elif explorer == 'cbas':
+                    vae = flexs.baselines.explorers.VAE(len(seed), alphabet=self.alphabet, epochs=10, verbose=True)
+                    self.explorer = CbAS(
+                        model=model,
+                        generator=vae,
+                        cycle_batch_size=100,
+                        rounds=1,
+                        starting_sequence=seed,
+                        sequences_batch_size=N,
+                        model_queries_per_batch=5 * N,
+                        alphabet=self.alphabet,
+                        algo= "cbas",
+                        **{name: val},
+                    )
+                else:
+                    raise ValueError('Unknown explorer: {}'.format(explorer))
 
                 # train predictive model on data
                 self.explorer.model.train(trainseqs_n, ytrain_n)
+                print('Regression model trained for {} = {}'.format(name, val))
                 predcal_n = self.explorer.model.get_fitness(calseqs_n)
 
                 # run design algorithm
                 testseqs_n, predtest_n = self.explorer.propose_sequences(train_data)
-                assert(len(testseqs_n) == n)
+                print('Designed sequences for {} = {}'.format(name, val))
+                assert(len(testseqs_n) == N)
+
                 ytest_n = self.landscape.get_fitness(testseqs_n)
-                noise = sc.stats.norm.rvs(loc=0, scale=self.noise_sd, size=len(testseqs_n)) # TODO HERE: clean up FLEXS
+                noise = sc.stats.norm.rvs(loc=0, scale=self.noise_sd, size=N) # TODO: clean up FLEXS
                 ytest_n = ytest_n + noise
                 testseqs_list.append((testseqs_n, ytest_n, predtest_n))
         
                 if save_fname_prefix is not None:
-                    
                     fname = os.path.join(save_fname_prefix, 'seed{}-n{}-nmut{}-{}{}.npz'.format(
                         seed_idx, n, avg_n_mut, name, val))
                     
@@ -110,16 +134,17 @@ class FLEXSShift(object):
 
 
 def generate_rna_data(model_class,
-                      explorer_class,
+                      explorer: str,
                       explorer_kwarg_name2vals,
                       save_fname_dir: str,
                       noise_sd: float = .0,
-                      n_trial: int = 1,
+                      trial_idxs = None,
                       model_kwargs = None,
                       seq_len: int = 50,
                       seed_idxs = None,
                       landscape_names = None,
                       ns = None,
+                      N: int = None,
                       avg_n_muts = None):
 
     if landscape_names is None:
@@ -127,6 +152,9 @@ def generate_rna_data(model_class,
         landscape_names = [name for name in landscape_names if 'L{}'.format(seq_len) in name and '+' not in name]
     print('Generating data from the following landscapes:')
     print(landscape_names)
+    if trial_idxs is None:
+        trial_idxs = range(10)
+        print('Using trial_idxs {}'.format(trial_idxs))
 
     if ns is None:
         ns = [1000, 10000]
@@ -149,7 +177,7 @@ def generate_rna_data(model_class,
 
                 for avg_n_mut in avg_n_muts:
 
-                    for t in range(n_trial):
+                    for t in trial_idxs:
 
                         save_fname_prefix = os.path.join(
                             '/data/wongfanc/dre-data/data', save_fname_dir, landscape_name, 'trial{}'.format(t)
@@ -161,8 +189,9 @@ def generate_rna_data(model_class,
                         _ = flexsshift.get_data(
                             n,
                             model_class,
-                            explorer_class,
+                            explorer,
                             explorer_kwarg_name2vals,
+                            N=N,
                             model_kwargs=model_kwargs,
                             seed_idx=seed_idx,
                             avg_n_mut=avg_n_mut,
@@ -202,7 +231,7 @@ def process_getted_data(trainseqs_n, ytrain_n, calseqs_n, testseqs_list):
 
     return X_m1xnxd, y_m1xn, pred_mxn, Xcal_nxd
 
-def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_name2vals, save_fname_dir: str, avg_n_mut: int, trial_idx: int):
+def load_rna_data(landscape_name: str, seed_idx: int, n: int, N: int, explorer_kwarg_name2vals, save_fname_dir: str, avg_n_mut: int, trial_idx: int):
     
     assert(len(explorer_kwarg_name2vals.keys()) == 1)
     hp_name = list(explorer_kwarg_name2vals.keys())[0]
@@ -212,15 +241,11 @@ def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_nam
     seq_length = int(parse('L{}_RNA{}', landscape_name)[0])
     print('Problem has sequence length {}'.format(seq_length))
     d = seq_length * len(sutils.RNAA)
-    X_m1xnxd = np.zeros([m + 1, n, d])
-    y_m1xn = np.zeros([m + 1, n])
-    pred_mxn = np.zeros([m, n])  # slice i corresponds to i in X_m1xnxd. no predictions on training data
+    X_mxnxd = np.zeros([m, N, d])
+    y_mxn = np.zeros([m, N])
+    pred_mxn = np.zeros([m, N])  # slice i corresponds to i in X_mxnxd. no predictions on training data
 
-    Xcal_mxnxd = np.zeros([m, n, d])  # slice i corresponds to training data going from i + 1 to i in X_m1xnxd
-    ycal_mxn = np.zeros([m, n])
-    predcal_mxn = np.zeros([m, n])  # slice i corresponds to i in Xcal_mxnxd
-
-    print('Loading waymarks in the following order for k = 0, 1, ..., m where k = 0 is the target design distribution.')
+    print('Loading waymarks in the following order for k = 0, 1, ... where k = 0 is the target design distribution.')
     print(hp_vals)
     
     for k, val in enumerate(hp_vals):
@@ -235,16 +260,9 @@ def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_nam
         # design data
         testseqs_n = loaded_dict['testseqs_n']
         Xk_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in testseqs_n])
-        X_m1xnxd[k] = Xk_nxd
-        y_m1xn[k] = loaded_dict['ytest_n']
+        X_mxnxd[k] = Xk_nxd
+        y_mxn[k] = loaded_dict['ytest_n']
         pred_mxn[k] = loaded_dict['predtest_n']  # no predictions on training data
-
-        # calibration data
-        calseqs_n = loaded_dict['calseqs_n']
-        Xk1cal_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in calseqs_n])
-        Xcal_mxnxd[k] = Xk1cal_nxd
-        ycal_mxn[k] = loaded_dict['ycal_n']
-        predcal_mxn[k] = loaded_dict['predcal_n']
 
         # print('After loading k = {}:'.format(k))
         # for i in range(m):  # sanity
@@ -262,12 +280,18 @@ def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_nam
         #     )
 
 
-    # training sequences. could load from any hp_val, all the same training sequences
+    # training and calibration sequences. could load from any hp_val, all the same training sequences
     loaded_dict = np.load(save_fname)
     trainseqs_n = loaded_dict['trainseqs_n']
-    Xm_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in trainseqs_n])
-    X_m1xnxd[-1] = Xm_nxd
-    y_m1xn[-1] = loaded_dict['ytrain_n']
+    Xtr_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in trainseqs_n])
+    calseqs_n = loaded_dict['calseqs_n']
+    assert(len(trainseqs_n) + len(calseqs_n) == n)
+    Xcal_nxd = np.array([sutils.string_to_one_hot(seq, sutils.RNAA).flatten() for seq in calseqs_n])
+    Xtrcal_nxd = np.concatenate([Xtr_nxd, Xcal_nxd], axis=0)
+    
+    # ytrain_n = loaded_dict['ytrain_n']
+    ycal_n = loaded_dict['ycal_n']
+    predcal_n = loaded_dict['predcal_n']
 
     # print('After loading training data:')
     # for i in range(m):  # sanity
@@ -284,4 +308,4 @@ def load_rna_data(landscape_name: str, seed_idx: int, n: int, explorer_kwarg_nam
     #     np.sum(y_m1xn[-1]),
     # )
 
-    return X_m1xnxd, y_m1xn, pred_mxn, Xcal_mxnxd, ycal_mxn, predcal_mxn
+    return X_mxnxd, y_mxn, pred_mxn, Xtrcal_nxd, Xcal_nxd, ycal_n, predcal_n
