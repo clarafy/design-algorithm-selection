@@ -742,7 +742,6 @@ class TelescopingLogDensityRatioEstimator(nn.Module):
                 logtrain_n = self.denom_kd_m[k].score_samples(ldr_nxm[:, k][:, None])
                 calibrated_ldr_nxm[:, k] = logdesign_n - logtrain_n
             ldr_nxm = calibrated_ldr_nxm
-        dr_nxm = np.exp(ldr_nxm)
         
         if self_normalized:
             c_1xm = np.max(ldr_nxm, axis=0, keepdims=True)
@@ -758,6 +757,7 @@ class TelescopingLogDensityRatioEstimator(nn.Module):
                 forecast_m = np.mean(pred0_mxn, axis=1, keepdims=False) - np.mean(weightedrectm_nxm, axis=0, keepdims=False)
         else:
             normalizeddr_nxm = None
+            dr_nxm = np.exp(ldr_nxm)
             print('Not returning normalized weights')
             if predm_n is None or pred0_mxn is None:
                 weightedym_nxm = dr_nxm * ym_n[:, None]

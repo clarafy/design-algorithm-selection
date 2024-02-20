@@ -6,6 +6,12 @@ import flexs.utils.sequence_utils as s_utils
 
 import editdistance
 
+def str2onehot(sequence: str, alphabet: str) -> np.ndarray:
+    out = np.zeros((len(sequence), len(alphabet)))
+    for i in range(len(sequence)):
+        out[i, alphabet.index(sequence[i])] = 1
+    return out
+
 def rmse(x, y, axis=None):
     return np.sqrt(np.mean(np.square(x - y), axis=axis))
 
