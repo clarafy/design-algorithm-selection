@@ -1,6 +1,7 @@
 from pathlib import Path
 import os.path
 import copy
+from itertools import product
 
 from time import time
 from tqdm import tqdm
@@ -20,6 +21,11 @@ from aav_util import SequenceTools
 
 AA = ''.join(SequenceTools.protein2codon_.keys())
 AA2IDX = {aa: idx for idx, aa in enumerate(AA)}
+
+AA_NOSTOP = ''.join([aa for aa in SequenceTools.protein2codon_.keys() if aa != '*'])
+ALL_NOSTOP_AA_SEQS = [''.join(aas) for aas in product(*(4 *[AA_NOSTOP]))]
+ALL_NOSTOP_AA_OHE = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
+
 NUCLEOTIDES = 'atcg'
 NUC2IDX = {nuc: idx for idx, nuc in enumerate(NUCLEOTIDES)}
 
@@ -52,9 +58,9 @@ def type_check_and_one_hot_encode_sequences(seq_n, alphabet, verbose: bool = Fal
 class EnrichmentFeedForward(torch.nn.Module):
     def __init__(
          self,
-            seq_len: int = 7,
+            seq_len: int = 4,
             alphabet: str = AA,
-            n_hidden: int = 100,
+            n_hidden: int = 10,
             n_model: int = 3,
             device = None,
             dtype = torch.float
@@ -98,6 +104,10 @@ class EnrichmentFeedForward(torch.nn.Module):
         if val_frac < 0:
             raise ValueError('val_frac = {} must be positive.'.format(val_frac))
         
+        if len(y_nx2.shape) == 1:
+            print('No fitness variance estimates provided. Using unweighted MSE loss.')
+            y_nx2 = np.hstack([y_nx2[:, None], 0.5 * np.ones([len(seq_n), 1])])
+
         ohe_nxla = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=True)
         dataset = [(ohe_la, y_mean_var[0], y_mean_var[1]) for ohe_la, y_mean_var in zip(ohe_nxla, y_nx2)]
 
@@ -180,6 +190,7 @@ class EnrichmentFeedForward(torch.nn.Module):
         fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
         self.load_state_dict(torch.load(fname))
 
+
 # ===== sampling sequences from design distribution =====
         
 def normalize_theta(theta_lxa, compute_log: bool = False):
@@ -194,8 +205,7 @@ def normalize_theta(theta_lxa, compute_log: bool = False):
         return logp_lxa
     return np.exp(logp_lxa)
 
-
-def sample_ohe_from_nuc_distribution(p_lxa, n_seq, normalize: bool = False):
+def sample_ohe_from_nuc_distribution(p_lxa, n_seq, normalize: bool = False, reject_stop_codon: bool = True):
     """
     Given nucleotide site-wise categorical distributions, sample one-hot-encoded nucleotide and corresponding AA sequences.
     """
@@ -208,46 +218,51 @@ def sample_ohe_from_nuc_distribution(p_lxa, n_seq, normalize: bool = False):
 
     # ----- sample nucleotides -----
     # for each sequence, sample nucleotide index at each site
-    nucidx_nxl = np.array([np.random.choice(len(NUCLEOTIDES), n_seq, p=p_lxa[i]) for i in range(nuc_seq_len)]).T
+    # propose 3x sequences to account for rejecting stop codons
+    nucidx_nxl = np.array([np.random.choice(len(NUCLEOTIDES), 3 * n_seq, p=p_lxa[i]) for i in range(nuc_seq_len)]).T
     # convert to OHE nucleotides
     nucohe_nxlxa = np.eye(len(NUCLEOTIDES))[nucidx_nxl]
 
     # ----- convert to amino acids -----
     # convert each sequence of nucleotide indices into OHE amino acids
     aaidx_nxl = np.empty([n_seq, int(nuc_seq_len / 3)])
-    for i in range(n_seq):
-        nucidx_l = nucidx_nxl[i]
+    aaseq_n = []
+    sample_idx = -1
+    proposal_idx = -1
+    accepted_proposal_idx = []
+    while sample_idx + 1 < n_seq:
+        proposal_idx += 1
+        if proposal_idx >= nucidx_nxl.shape[0]:
+            raise ValueError('Not enough nucidx_l proposed ({}), increase number.'.format(nucidx_nxl.shape[0]))
+        
+        nucidx_l = nucidx_nxl[proposal_idx]
         # convert nucleotide indices to nucleotide bases
         nucseq = ''.join([NUCLEOTIDES[idx] for idx in nucidx_l])
         # translate nucleotides into amino acids
         aaseq = str(Seq(nucseq).translate()).lower()
+
+        if reject_stop_codon:
+            if '*' not in aaseq:
+                sample_idx += 1
+            else:
+                continue
+        else:
+            sample_idx += 1
+        accepted_proposal_idx.append(proposal_idx)
+
+        aaseq_n.append(aaseq)
         # convert amino acids to amino acid indices
-        aaidx_nxl[i] = [AA2IDX[aa] for aa in aaseq]
+        aaidx_nxl[sample_idx] = [AA2IDX[aa] for aa in aaseq]
+
     # convert to OHE amino acids
     aaohe_nxlxa = np.eye(len(AA))[aaidx_nxl.astype(int)]
+    assert(len(aaseq_n) == aaohe_nxlxa.shape[0])
+    accepted_proposal_idx = np.array(accepted_proposal_idx)
+    assert(accepted_proposal_idx.size == len(aaseq_n))
 
-    return nucohe_nxlxa, aaohe_nxlxa
+    return nucohe_nxlxa[accepted_proposal_idx], aaohe_nxlxa, aaseq_n
 
-
-# ===== solving optimization problem to define design distribution =====
-
-def get_entropy(p_lxa, normalize: bool = False):
-    """
-    Calculates entropy from normalized probabilities of site-wise categorical distributions.
-    """
-    if normalize:
-        p_lxa = normalize_theta(p_lxa)
-    p_ma_lxa = np.ma.masked_where(p_lxa == 0, p_lxa)
-    logp_lxa = np.log(p_ma_lxa)
-    H = -np.sum(p_ma_lxa * logp_lxa)
-    return H
-
-def fit_mle_paa(aaohe_nxlxa: np.array):
-    counts_lxa = np.sum(aaohe_nxlxa, axis=0, keepdims=False)
-    paa_lxa = counts_lxa / np.sum(counts_lxa, axis=1, keepdims=True)
-    return paa_lxa
-
-def get_aa_probs_from_nuc_probs(pnuc_lxa: np.array):  # TODO: test
+def get_aa_probs_from_nuc_probs(pnuc_lxa: np.array):
     """
     Computes amino acid site-wise categorical distribution probabilities
     given nucleotide site-wise categorical distribution probabilities.
@@ -265,6 +280,39 @@ def get_aa_probs_from_nuc_probs(pnuc_lxa: np.array):  # TODO: test
                 paa_axl[cod_site + 1].loc[aa] += p_cod
     return np.array(paa_axl).T
 
+
+# ===== solving optimization problem to define design distribution =====
+
+# NNK library (training sequence distribution):
+# nucleotide categorical distributions per site in one codon
+PNUC_NNK_ONECODON = np.array([
+    [0.25, 0.25, 0.25, 0.25],
+    [0.25, 0.25, 0.25, 0.25],
+    [0, 0.5, 0, 0.5],
+])
+PNUC_NNK_LXA = np.tile(PNUC_NNK_ONECODON, [4, 1])
+
+# amino acid categorical distribution corresponding to NNK
+PAA_NNK_LXA = get_aa_probs_from_nuc_probs(PNUC_NNK_LXA)
+
+def get_entropy(p_lxa, normalize: bool = False):
+    """
+    Calculates entropy from normalized probabilities of site-wise categorical distributions.
+    """
+    if normalize:
+        p_lxa = normalize_theta(p_lxa)
+    p_ma_lxa = np.ma.masked_where(p_lxa == 0, p_lxa)
+    logp_lxa = np.log(p_ma_lxa)
+    H = -np.sum(p_ma_lxa * logp_lxa)
+    return H
+
+def fit_mle_paa(aaohe_nxlxa: np.array, weight_n: np.array = None):
+    if weight_n is None:
+        weight_n = np.ones([aaohe_nxlxa.shape[0]])
+    counts_lxa = np.sum(weight_n[:, None, None] * aaohe_nxlxa, axis=0, keepdims=False)
+    paa_lxa = counts_lxa / np.sum(counts_lxa, axis=1, keepdims=True)
+    return paa_lxa
+
 def get_expected_pairwise_distance(pnuc_lxa, normalize: bool = False):  # TODO: test
     """
     Calculates the expected pairwise distance between amino acid sequences
@@ -276,6 +324,21 @@ def get_expected_pairwise_distance(pnuc_lxa, normalize: bool = False):  # TODO: 
     epd = paa_lxa.shape[0] - np.sum(np.square(paa_lxa))
     return epd
 
+def get_nostop_normalizing_constant(logp_lxa: np.array):
+    alllogp_n = get_loglikelihood(ALL_NOSTOP_AA_OHE, logp_lxa)
+    allp_n = np.exp(alllogp_n)
+    return np.sum(allp_n)
+
+def get_nostop_loglikelihood(ohe_nxlxa: np.array, p_lxa: np.array):
+    """
+    Calculates the log-probability of OHE sequences, accounting for rejecting sequences with stop codons,
+    given the probabiliies of site-wise categorical distributions.
+    """
+    logp_lxa = np.log(p_lxa)
+    normalizing_const = get_nostop_normalizing_constant(logp_lxa)
+    logp_withstop_n = get_loglikelihood(ohe_nxlxa, logp_lxa)
+    return logp_withstop_n - np.log(normalizing_const)
+
 def get_loglikelihood(ohe_nxlxa: np.array, logp_lxa: np.array):
     """
     Calculates the log-probability of OHE sequences given the log-probabiliies of site-wise categorical distributions.
@@ -286,9 +349,9 @@ def get_loglikelihood(ohe_nxlxa: np.array, logp_lxa: np.array):
 def solve_max_entropy_library(
     model: EnrichmentFeedForward,
     temperature: float,
-    lr: float = 0.01,
+    lr: float = 0.1,
     n_sample: int = 1000,
-    n_iter: int = 2000,
+    n_iter: int = 3000,
     print_every: int = 500,
     initialization: str = 'rand',
     save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/aav-models',
@@ -309,7 +372,9 @@ def solve_max_entropy_library(
         logp_lxa = normalize_theta(theta_lxa, compute_log=True)
         p_lxa = np.exp(logp_lxa)
 
-        nucohe_nxlxa, aaohe_nxlxa = sample_ohe_from_nuc_distribution(p_lxa, n_sample, normalize=False)
+        nucohe_nxlxa, aaohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
+            p_lxa, n_sample, normalize=False, reject_stop_codon=False
+        )
         grad_logp_nxlxa = nucohe_nxlxa - p_lxa[None, :, :]
 
         pred_n = model.predict(aaohe_nxlxa)
@@ -320,14 +385,18 @@ def solve_max_entropy_library(
         theta_lxa = theta_lxa + lr * np.mean(grad_theta_nxlxa, axis=0)
 
         # record and print metrics
+        _, aaohe_nostop_nxlxa, _ = sample_ohe_from_nuc_distribution(
+            p_lxa, n_sample, normalize=False, reject_stop_codon=False
+        )
+        prednostop_n = model.predict(aaohe_nostop_nxlxa)
         meanpred = np.mean(pred_n)
         entropy = get_entropy(p_lxa, normalize=False)
         epd = get_expected_pairwise_distance(p_lxa, normalize=False)
         obj = meanpred + temperature * entropy
         df_rows.append([obj, meanpred, entropy, epd])
         if t == 0 or (t + 1) % print_every == 0:
-            print('Iter: {}. Objective: {:.2f}. Mean prediction: {:.2f}. Entropy: {:.2f}. EPD: {:.2f}'.format(
-                t + 1, obj, meanpred, entropy, epd
+            print('Iter: {}. Objective: {:.2f}. Mean prediction: {:.2f}. Mean no-stop prediction: {:.2f}. Entropy: {:.2f}. AA EPD: {:.2f}'.format(
+                t + 1, obj, meanpred, np.mean(prednostop_n), entropy, epd
             ))
 
     df = DataFrame(data=df_rows, index=range(1, n_iter + 1), columns=['objective', 'mean_prediction', 'entropy', 'epd'])
@@ -340,89 +409,6 @@ def solve_max_entropy_library(
         print('Saved parameters to:           {}'.format(npz_fname))
         print('Saved optimization metrics to: {}'.format(csv_fname))
     return theta_lxa, df
-    
-
-# ===== rejection sampling labeled sequences from design distribution =====
-        
-# NNK library (training sequence distribution):
-# nucleotide categorical distributions per site in one codon
-pnuc_nnk_onecodon = np.array([
-    [0.25, 0.25, 0.25, 0.25],
-    [0.25, 0.25, 0.25, 0.25],
-    [0, 0.5, 0, 0.5],
-])
-pnuc_nnk_lxa = np.tile(pnuc_nnk_onecodon, [7, 1])
-
-# amino acid categorical distribution corresponding to NNK
-PAA_NNK_LXA = get_aa_probs_from_nuc_probs(pnuc_nnk_lxa)
-LOG_PAA_NNK_LXA = np.log(PAA_NNK_LXA)
-
-PAA_TRAIN_LXA = np.array([[0.11761193, 0.10138472, 0.05234972, 0.04028293, 0.0213146 ,
-        0.052903  , 0.06628948, 0.01273418, 0.02993992, 0.08095019,
-        0.05965383, 0.0891105 , 0.01228438, 0.05747265, 0.02829436,
-        0.06989968, 0.02867845, 0.03098742, 0.01180407, 0.00625449,
-        0.02979949],
-       [0.07070959, 0.10591742, 0.0317805 , 0.05700566, 0.02261185,
-        0.01913062, 0.06026451, 0.02132664, 0.02921909, 0.09188927,
-        0.08406369, 0.09549338, 0.02913339, 0.0359691 , 0.01658605,
-        0.08830269, 0.03262058, 0.05244712, 0.02216111, 0.00547755,
-        0.02789016],
-       [0.08291938, 0.11901897, 0.04583929, 0.04722025, 0.02426138,
-        0.03359442, 0.06821308, 0.02453159, 0.02679402, 0.08013197,
-        0.07285406, 0.10083951, 0.04038009, 0.04053981, 0.01664393,
-        0.07148338, 0.02506124, 0.03692494, 0.01392035, 0.00936847,
-        0.01945987],
-       [0.07935584, 0.12050446, 0.04084813, 0.04881787, 0.02629629,
-        0.03079087, 0.06813053, 0.02455345, 0.0252316 , 0.08218196,
-        0.07497829, 0.10949733, 0.03628035, 0.0380765 , 0.01382483,
-        0.07510842, 0.02598457, 0.03873804, 0.01385827, 0.00812536,
-        0.01881703],
-       [0.09299593, 0.09486072, 0.03356753, 0.05783359, 0.02381883,
-        0.0310868 , 0.05627689, 0.02035748, 0.02591687, 0.09496688,
-        0.07822228, 0.12213248, 0.02630038, 0.04649791, 0.01689192,
-        0.07505873, 0.02109619, 0.04610832, 0.01513412, 0.00525201,
-        0.01562414],
-       [0.11247837, 0.08311172, 0.02778528, 0.04948233, 0.01456482,
-        0.02145327, 0.04332757, 0.01730278, 0.02873434, 0.11364338,
-        0.07822275, 0.16170114, 0.02837925, 0.03457902, 0.01375035,
-        0.07244916, 0.02437526, 0.03224713, 0.01258604, 0.00650927,
-        0.02331677],
-       [0.09364111, 0.11485527, 0.02239484, 0.02783334, 0.01943964,
-        0.03182166, 0.06675881, 0.01239616, 0.03424556, 0.09220823,
-        0.09352699, 0.13134767, 0.02100487, 0.03702023, 0.01522789,
-        0.08378764, 0.03034774, 0.02979891, 0.01248677, 0.00953509,
-        0.02032158]])
-
-LOG_PAA_TRAIN_LXA = np.log(PAA_TRAIN_LXA)
-
-def get_rejection_sampling_acceptance_probabilities(trainseq_n, theta_lxa):
-    pnuc_lxa = normalize_theta(theta_lxa)
-    paa_lxa = get_aa_probs_from_nuc_probs(pnuc_lxa)
-    ratio_lxa = paa_lxa / PAA_NNK_LXA
-    maxp_l = np.max(ratio_lxa, axis=1)
-    M = np.prod(maxp_l)
-
-    # compute test likelihoods of training sequences
-    ohe_nxlxa = np.stack([utils.str2onehot(seq, AA) for seq in trainseq_n])
-    logptest_n = get_loglikelihood(ohe_nxlxa, np.log(paa_lxa))
-
-    # compute training likelihoods of training sequences
-    logptrain_n = get_loglikelihood(ohe_nxlxa, LOG_PAA_NNK_LXA)
-    paccept_n = np.exp(logptest_n - (np.log(M) + logptrain_n))
-    return paccept_n
-
-def rejection_sample_from_test_distribution(proposal_seq_n, y_n, theta_lxa: np.array):
-    paccept_n = get_rejection_sampling_acceptance_probabilities(proposal_seq_n, theta_lxa)
-    nonzero_samples_from_test = False
-    while not nonzero_samples_from_test:
-        accept_n = sc.stats.bernoulli.rvs(paccept_n)
-        samp_idx = np.where(accept_n)[0]
-        n_test = samp_idx.size
-        if n_test:
-            nonzero_samples_from_test = True
-    sampseq_n = [proposal_seq_n[i] for i in samp_idx]
-    ysamp_n = y_n[samp_idx]
-    return sampseq_n, ysamp_n
 
 
 # ===== temperature selection through multiple hypothesis testing =====
@@ -430,26 +416,37 @@ def rejection_sample_from_test_distribution(proposal_seq_n, y_n, theta_lxa: np.a
 def get_density_ratios(aaohe_nxlxa: np.array, theta_lxa: np.array, logptrain_n: np.array = None):
     pnuc_lxa = normalize_theta(theta_lxa, compute_log=False)
     paa_lxa = get_aa_probs_from_nuc_probs(pnuc_lxa)
-    logpdesign_n = get_loglikelihood(aaohe_nxlxa, np.log(paa_lxa))
+    logpdesign_n = get_nostop_loglikelihood(aaohe_nxlxa, paa_lxa)
     if logptrain_n is None:
-        logptrain_n = get_loglikelihood(aaohe_nxlxa, LOG_PAA_NNK_LXA)
+        logptrain_n = get_nostop_loglikelihood(aaohe_nxlxa, PAA_NNK_LXA)
     return np.exp(logpdesign_n - logptrain_n)
 
-def get_true_means_from_theta(temp2theta, valseq_n, yval_n: np.array):
+def get_true_mean_prediction_from_theta(temp2theta, model):
     temp2mean = {}
-    print('One-hot encoding validation sequences...')
+    print('True mean prediction for temperature...')
     t0 = time()
-    valohe_nxlxa = np.stack([utils.str2onehot(seq, AA) for seq in valseq_n])
-    print('Done ({} sec)'.format(int(time() - t0)))
-    logptrain_n = get_loglikelihood(valohe_nxlxa, LOG_PAA_NNK_LXA)
-
-    print('True mean for temperature...')
-    t0 = time()
+    pred_n = model.predict(ALL_NOSTOP_AA_OHE)
     for temp, theta_lxa in temp2theta.items():
-        valdr_n = get_density_ratios(valohe_nxlxa, theta_lxa, logptrain_n=logptrain_n)
-        ess = np.square(np.sum(valdr_n)) / np.sum(np.square(valdr_n))
-        temp2mean[temp] = np.mean(valdr_n * yval_n)
-        print('    {:.4f} is {:.4f}, ESS = {}. ({} sec)'.format(temp, temp2mean[temp], int(ess), int(time() - t0)))
+        paa_lxa = get_aa_probs_from_nuc_probs(normalize_theta(theta_lxa))
+        pdesign_n = np.exp(get_nostop_loglikelihood(ALL_NOSTOP_AA_OHE, paa_lxa))
+        truemean = np.sum([p * pred for p, pred in zip(pdesign_n, pred_n)])
+        temp2mean[temp] = truemean
+        print('    {:.4f} is {:.4f}. ({} sec)'.format(temp, truemean, int(time() - t0)))
+    return temp2mean
+
+def get_true_mean_label_from_theta(temp2theta, seq2y):
+    temp2mean = {}
+    print('True mean label for temperature...')
+    t0 = time()
+    seq_n = list(seq2y.keys())
+    assert(set(seq_n) == set(ALL_NOSTOP_AA_SEQS))
+    ohe_nxlxa = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
+    for temp, theta_lxa in temp2theta.items():
+        paa_lxa = get_aa_probs_from_nuc_probs(normalize_theta(theta_lxa))
+        pdesign_n = np.exp(get_nostop_loglikelihood(ohe_nxlxa, paa_lxa))
+        truemean = np.sum([p * seq2y[seq] for seq, p in zip(ALL_NOSTOP_AA_SEQS, pdesign_n)])
+        temp2mean[temp] = truemean
+        print('    {:.4f} is {:.4f}. ({} sec)'.format(temp, truemean, int(time() - t0)))
     return temp2mean
     
 def run_temperature_selection_experiments(
@@ -483,7 +480,7 @@ def run_temperature_selection_experiments(
         temp_df = DataFrame(index=temperatures, columns=['imputed_mean', 'imputed_stderr', 'rectifier_mean', 'rectifier_stderr'])
         for temp, theta_lxa in temp2theta.items(): 
             # sample unlabeled sequences from design distribution
-            _, designohe_nxlxa = sample_ohe_from_nuc_distribution(theta_lxa, n_design, normalize=True)
+            _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(theta_lxa, n_design, normalize=True)
 
             # predictions for design sequences
             preddesign_n = model.predict(designohe_nxlxa)
@@ -495,7 +492,8 @@ def run_temperature_selection_experiments(
             # ----- quantities for prediction-powered hypothesis test -----
             # density ratios on labeled calibration sequences
             caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa)
-            caldr_n = caldr_n / np.sum(caldr_n) * len(calseq_n)  
+             # TODO: self-normalize? how to use PPI functions if don't?
+            caldr_n = caldr_n / np.sum(caldr_n) * len(calseq_n) 
             cal_ess = np.square(np.sum(caldr_n)) / np.sum(np.square(caldr_n))
             # print(i, temp, int(cal_ess))
 
