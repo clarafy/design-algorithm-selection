@@ -6,30 +6,59 @@ from itertools import product
 from time import time
 from tqdm import tqdm
 import numpy as np
-import scipy as sc
-from pandas import DataFrame
+from pandas import DataFrame, read_csv
 from Bio.Seq import Seq
 from statsmodels.stats.weightstats import _zstat_generic
-
+from sklearn.linear_model import LogisticRegression
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
 import utils
 from calibrate import rectified_p_value
-from aav_util import SequenceTools
 
-AA = ''.join(SequenceTools.protein2codon_.keys())
+AA2CODON = {
+        'l': ['tta', 'ttg', 'ctt', 'ctc', 'cta', 'ctg'],
+        's': ['tct', 'tcc', 'tca', 'tcg', 'agt', 'agc'],
+        'r': ['cgt', 'cgc', 'cga', 'cgg', 'aga', 'agg'],
+        'v': ['gtt', 'gtc', 'gta', 'gtg'],
+        'a': ['gct', 'gcc', 'gca', 'gcg'],
+        'p': ['cct', 'ccc', 'cca', 'ccg'],
+        't': ['act', 'acc', 'aca', 'acg'],
+        'g': ['ggt', 'ggc', 'gga', 'ggg'],
+        '*': ['taa', 'tag', 'tga'],
+        'i': ['att', 'atc', 'ata'],
+        'y': ['tat', 'tac'],
+        'f': ['ttt', 'ttc'],
+        'c': ['tgt', 'tgc'],
+        'h': ['cat', 'cac'],
+        'q': ['caa', 'cag'],
+        'n': ['aat', 'aac'],
+        'k': ['aaa', 'aag'],
+        'd': ['gat', 'gac'],
+        'e': ['gaa', 'gag'],
+        'w': ['tgg'],
+        'm': ['atg']
+    }
+
+AA = ''.join(AA2CODON.keys())
 AA2IDX = {aa: idx for idx, aa in enumerate(AA)}
 
-AA_NOSTOP = ''.join([aa for aa in SequenceTools.protein2codon_.keys() if aa != '*'])
+AA_NOSTOP = ''.join([aa for aa in AA2CODON.keys() if aa != '*'])
 ALL_NOSTOP_AA_SEQS = [''.join(aas) for aas in product(*(4 *[AA_NOSTOP]))]
 ALL_NOSTOP_AA_OHE = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
 
 NUCLEOTIDES = 'atcg'
 NUC2IDX = {nuc: idx for idx, nuc in enumerate(NUCLEOTIDES)}
 
-# ===== models for predicting AAV packaging from sequence =====
+df = read_csv('../data/gb1-with-variance.csv')
+seq_n = list(df['Variants'].str.lower())
+y_n = df['log_fitness'].to_numpy()
+var_n = df['estimated_variance'].to_numpy()
+SEQ2YVAR = {seq: [y, var] for seq, y, var in zip(seq_n, y_n, var_n)}
+assert(set(seq_n) == set(ALL_NOSTOP_AA_SEQS))
+
+# ===== models for predicting enrichment from sequence =====
 
 def type_check_and_one_hot_encode_sequences(seq_n, alphabet, verbose: bool = False):
     if isinstance(seq_n[0], str):
@@ -54,6 +83,24 @@ def type_check_and_one_hot_encode_sequences(seq_n, alphabet, verbose: bool = Fal
     else:
         raise ValueError('Unrecognized seq_n type: {} is type {}'.format(seq_n[0], type(seq_n[0])))
     return ohe_nxla
+
+class ExceedancePredictor():
+    def __init__(self, model, threshold: float) -> None:
+        self.model = model
+        self.threshold = threshold
+        self.lr = LogisticRegression(class_weight='balanced')
+        self.lr_fitted = False
+
+    def fit(self, ohe_nxlxa: np.array, binary_y_n: np.array):
+        pred_n = self.model.predict(ohe_nxlxa)
+        self.lr.fit(pred_n[:, None], binary_y_n)
+        self.lr_fitted = True
+
+    def predict(self, ohe_nxlxa: np.array):
+        if not self.lr_fitted:
+            # print('Warning: ExceedancePredictor has not been fit. Making predictions by thresholding.')
+            return (self.model.predict(ohe_nxlxa) >= self.threshold).astype(float)
+        return self.lr.predict_proba(self.model.predict(ohe_nxlxa)[:, None])[:, 1]
 
 class EnrichmentFeedForward(torch.nn.Module):
     def __init__(
@@ -180,13 +227,13 @@ class EnrichmentFeedForward(torch.nn.Module):
         tohe_nxla = torch.from_numpy(ohe_nxla).to(device=self.device, dtype=self.dtype)
         return self(tohe_nxla).cpu().detach().numpy()
     
-    def save(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/aav-models'):
+    def save(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-models'):
         Path(save_path).mkdir(parents=True, exist_ok=True)
         fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
         torch.save(self.state_dict(), fname)
         print('Saved models to {}.'.format(fname))
     
-    def load(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/aav-models'):
+    def load(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-models'):
         fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
         self.load_state_dict(torch.load(fname))
 
@@ -218,8 +265,8 @@ def sample_ohe_from_nuc_distribution(p_lxa, n_seq, normalize: bool = False, reje
 
     # ----- sample nucleotides -----
     # for each sequence, sample nucleotide index at each site
-    # propose 3x sequences to account for rejecting stop codons
-    nucidx_nxl = np.array([np.random.choice(len(NUCLEOTIDES), 3 * n_seq, p=p_lxa[i]) for i in range(nuc_seq_len)]).T
+    # propose 10x sequences to account for rejecting stop codons
+    nucidx_nxl = np.array([np.random.choice(len(NUCLEOTIDES), 10 * n_seq, p=p_lxa[i]) for i in range(nuc_seq_len)]).T
     # convert to OHE nucleotides
     nucohe_nxlxa = np.eye(len(NUCLEOTIDES))[nucidx_nxl]
 
@@ -270,7 +317,7 @@ def get_aa_probs_from_nuc_probs(pnuc_lxa: np.array):
     nuc_seq_len = pnuc_lxa.shape[0]
     paa_axl = DataFrame(0., index=list(AA), columns=range(1, int(nuc_seq_len / 3) + 1))
     for aa in AA:
-        codons = SequenceTools.protein2codon_[aa]
+        codons = AA2CODON[aa]
         for cod_site in range(int(nuc_seq_len / 3)):  # for each codon site
             for cod in codons:
                 p_cod = 1
@@ -306,6 +353,7 @@ def get_entropy(p_lxa, normalize: bool = False):
     H = -np.sum(p_ma_lxa * logp_lxa)
     return H
 
+# TODO: can delete, just convenient for debugging
 def fit_mle_paa(aaohe_nxlxa: np.array, weight_n: np.array = None):
     if weight_n is None:
         weight_n = np.ones([aaohe_nxlxa.shape[0]])
@@ -354,7 +402,7 @@ def solve_max_entropy_library(
     n_iter: int = 3000,
     print_every: int = 500,
     initialization: str = 'rand',
-    save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/aav-models',
+    save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-models',
     save_fname_no_ftype: str = None
 ):
     # initialize parameters of nucleotide site-wise categorical distributions
@@ -421,112 +469,171 @@ def get_density_ratios(aaohe_nxlxa: np.array, theta_lxa: np.array, logptrain_n: 
         logptrain_n = get_nostop_loglikelihood(aaohe_nxlxa, PAA_NNK_LXA)
     return np.exp(logpdesign_n - logptrain_n)
 
-def get_true_mean_prediction_from_theta(temp2theta, model):
+# TODO: can delete, just convenient for debugging
+def get_true_mean_prediction_from_theta(temp2theta, model, threshold: float = None, verbose: bool = False):
     temp2mean = {}
-    print('True mean prediction for temperature...')
+    if verbose:
+        print('True mean prediction for temperature...')
     t0 = time()
     pred_n = model.predict(ALL_NOSTOP_AA_OHE)
+    if threshold is not None:
+        pred_n = (pred_n >= threshold).astype(float)
     for temp, theta_lxa in temp2theta.items():
         paa_lxa = get_aa_probs_from_nuc_probs(normalize_theta(theta_lxa))
         pdesign_n = np.exp(get_nostop_loglikelihood(ALL_NOSTOP_AA_OHE, paa_lxa))
         truemean = np.sum([p * pred for p, pred in zip(pdesign_n, pred_n)])
         temp2mean[temp] = truemean
-        print('    {:.4f} is {:.4f}. ({} sec)'.format(temp, truemean, int(time() - t0)))
+        if verbose:
+            print('    {:.4f} is {:.4f}. ({} sec)'.format(temp, truemean, int(time() - t0)))
     return temp2mean
 
-def get_true_mean_label_from_theta(temp2theta, seq2y):
+def get_true_mean_label_from_theta(temp2theta, threshold: float = None, verbose: bool = False):
     temp2mean = {}
-    print('True mean label for temperature...')
+    if verbose:
+        print('True mean for temperature...')
     t0 = time()
-    seq_n = list(seq2y.keys())
-    assert(set(seq_n) == set(ALL_NOSTOP_AA_SEQS))
     ohe_nxlxa = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
     for temp, theta_lxa in temp2theta.items():
         paa_lxa = get_aa_probs_from_nuc_probs(normalize_theta(theta_lxa))
         pdesign_n = np.exp(get_nostop_loglikelihood(ohe_nxlxa, paa_lxa))
-        truemean = np.sum([p * seq2y[seq] for seq, p in zip(ALL_NOSTOP_AA_SEQS, pdesign_n)])
+        truemean = np.sum([
+            p * SEQ2YVAR[seq][0] if threshold is None else p * (SEQ2YVAR[seq][0] >= threshold).astype(float)
+            for seq, p in zip(ALL_NOSTOP_AA_SEQS, pdesign_n)
+        ])
         temp2mean[temp] = truemean
-        print('    {:.4f} is {:.4f}. ({} sec)'.format(temp, truemean, int(time() - t0)))
+        if verbose:
+            print('    {:.4f} is {:.4f}. ({} sec)'.format(temp, truemean, int(time() - t0)))
     return temp2mean
     
 def run_temperature_selection_experiments(
     model: EnrichmentFeedForward,
     temp2theta,
     target_values: np.array,
-    candidate_cal_seq_n,
-    y_candidate_cal_n: np.array,
-    n_cal: int = 100000,
+    exceedance_threshold: float = None,
+    n_cal: int = 5000,
+    n_design: int = 1000000,
     alpha: float = 0.1,
-    n_trial: int = 100,
-    n_design: int = 100000,
-    print_every: int = 10,
+    n_trial: int = 1000,
+    n_train_lr: int = 500,
+    self_normalize_weights: bool = True,
+    save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-results',
+    results_csv_fname: str = None,
+    design_samples_fname_prefix: str = None,
+    load_design_samples: bool = False,
+    save_design_samples: bool = False
 ):
     
     temperatures = list(temp2theta.keys())
     imp_selected_column_names = ['tr{}_imp_selected_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
     pp_selected_column_names = ['tr{}_pp_selected_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
-    true_column_names = ['temp{:.4f}_true_mean'.format(temp) for temp in temperatures]
     df = DataFrame(
-        index=target_values, columns=imp_selected_column_names + pp_selected_column_names + true_column_names
+        index=target_values, columns=imp_selected_column_names + pp_selected_column_names
     )
+
+    if results_csv_fname is not None:
+        Path(save_path).mkdir(parents=True, exist_ok=True)
+        results_fname = os.path.join(save_path, results_csv_fname)
+
+    if load_design_samples and save_design_samples:
+        raise ValueError('Only one of load_design_samples or save_design_samples can be True.') 
+    if load_design_samples or save_design_samples:
+        if design_samples_fname_prefix is None:
+            raise ValueError('Provide design_samples_fname_prefix.')
+        
+    if exceedance_threshold is not None:
+        print('Selection quantity is probability of exceeding {}.'.format(exceedance_threshold))
+        # seq2y = {seq: (SEQ2YVAR[seq][0] >= exceedance_threshold).astype(float) for seq in SEQ2YVAR.keys()}
+    else:
+        print('Selection quantity is the mean label.')
+        predictor = model
+        # seq2y = SEQ2YVAR
+    print('Range of provided target values: [{:.4f}, {:.4f}].\n'.format(np.min(target_values), np.max(target_values)))
+
     
     t0 = time() 
-    for i in range(n_trial):
-        cal_idx = np.random.choice(len(candidate_cal_seq_n), n_cal, replace=False)
-        calseq_n = [candidate_cal_seq_n[i] for i in cal_idx]
-        ycal_n = y_candidate_cal_n[cal_idx]
-        calohe_nxlxa = np.stack([utils.str2onehot(seq, AA) for seq in calseq_n])
+    for t, (temp, theta_lxa) in enumerate(temp2theta.items()):
 
-        temp_df = DataFrame(index=temperatures, columns=['imputed_mean', 'imputed_stderr', 'rectifier_mean', 'rectifier_stderr'])
-        for temp, theta_lxa in temp2theta.items(): 
+        # sampling design sequences is the bottleneck for computation
+        if load_design_samples:
+            design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
+            d = np.load(design_samples_fname)
+            designohe_nxlxa = d['designohe_nxlxa']
+            if designohe_nxlxa.shape[0] != n_design:
+                raise ValueError('Loaded {} != n_design = {} design sequences from {}.'.format(
+                    designohe_nxlxa.shape[0], n_design, design_samples_fname
+                ))
+            print('Loaded {} design sequences from {}.'.format(n_design, design_samples_fname))
+        else:
             # sample unlabeled sequences from design distribution
-            _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(theta_lxa, n_design, normalize=True)
+            _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
+                theta_lxa, n_design, normalize=True, reject_stop_codon=True
+            )
+            print('Sampled {} design sequences for temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
+            if save_design_samples:
+                design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
+                np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
+                print('Saved design samples to {}.'.format(design_samples_fname))
+            
+        # predictions for unlabeled design sequences
+        if exceedance_threshold is not None:
+            predictor = ExceedancePredictor(model, exceedance_threshold)
+        preddesign_n = predictor.predict(designohe_nxlxa)
+        imputed_mean = np.mean(preddesign_n)
+        imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
 
-            # predictions for design sequences
-            preddesign_n = model.predict(designohe_nxlxa)
+        for i in range(n_trial):
 
-            # imputation sample mean and standard error
-            temp_df.loc[temp]['imputed_mean'] = np.mean(preddesign_n)
-            temp_df.loc[temp]['imputed_stderr'] = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
+            # sample labeled calibration data from NNK
+            _, calohe_nxlxa, calseq_n = sample_ohe_from_nuc_distribution(
+                PNUC_NNK_LXA, n_cal, normalize=False, reject_stop_codon=True
+            )
+            ycal_n = np.array([SEQ2YVAR[seq][0] for seq in calseq_n])
+
+            # TODO: double-check LR fit/predict order/logic
+            if exceedance_threshold is not None:
+                sampled_both_labels = False
+                while not sampled_both_labels:
+                    shuffle_idx = np.random.permutation(n_cal)
+                    train_idx, cal_idx = shuffle_idx[: n_train_lr], shuffle_idx[n_train_lr :]
+                    sampled_both_labels = any(ycal_n[train_idx] >= exceedance_threshold) and any(ycal_n[cal_idx] >= exceedance_threshold)
+                trainohe_nxlxa, calohe_nxlxa = calohe_nxlxa[train_idx], calohe_nxlxa[cal_idx]
+                ytrain_n = (ycal_n[train_idx] >= exceedance_threshold).astype(float)
+                ycal_n = (ycal_n[cal_idx] >= exceedance_threshold).astype(float)
+                predictor.fit(trainohe_nxlxa, ytrain_n)
+
+            # predictions for calibration sequences
+            predcal_n = predictor.predict(calohe_nxlxa)
+            callogptrain_n = get_nostop_loglikelihood(calohe_nxlxa, PAA_NNK_LXA)
 
             # ----- quantities for prediction-powered hypothesis test -----
             # density ratios on labeled calibration sequences
-            caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa)
-             # TODO: self-normalize? how to use PPI functions if don't?
-            caldr_n = caldr_n / np.sum(caldr_n) * len(calseq_n) 
+            caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa, logptrain_n=callogptrain_n)
             cal_ess = np.square(np.sum(caldr_n)) / np.sum(np.square(caldr_n))
-            # print(i, temp, int(cal_ess))
-
-            # predictions for calibration sequences
-            predcal = model.predict(calohe_nxlxa)
-
+            if self_normalize_weights:
+                caldr_n = caldr_n / np.sum(caldr_n) * caldr_n.size
+        
             # rectifier sample mean and standard error
-            rect_n = caldr_n * (ycal_n - predcal)
-            temp_df.loc[temp]['rectifier_mean'] = np.mean(rect_n)
-            temp_df.loc[temp]['rectifier_stderr'] = np.std(rect_n) / np.sqrt(len(calseq_n))
-
-            # print('temp {:.4f}, imp mean {:.4f}, imp stderr {:.4f}, rect mean {:.4f}, rect stderr {:.4f}'.format(
-            #     temp, temp_df.loc[temp]['imputed_mean'], temp_df.loc[temp]['imputed_stderr'],
-            #     temp_df.loc[temp]['rectifier_mean'], temp_df.loc[temp]['rectifier_stderr']
-            # ))
+            rect_n = caldr_n * (ycal_n - predcal_n)
+            rectifier_mean = np.mean(rect_n)
+            rectifier_se = np.std(rect_n) / np.sqrt(rect_n.size)
 
             for target_val in target_values:
 
                 # run imputation hypothesis test
                 imp_pval = _zstat_generic(
-                    temp_df.loc[temp]['imputed_mean'],
+                    imputed_mean,
                     0,
-                    temp_df.loc[temp]['imputed_stderr'],
+                    imputed_se,
                     alternative='larger',
                     diff=target_val
                 )[1]
 
                 # run prediction-powered hypothesis test
                 pp_pval = rectified_p_value(
-                    temp_df.loc[temp]['rectifier_mean'],
-                    temp_df.loc[temp]['rectifier_stderr'],
-                    temp_df.loc[temp]['imputed_mean'],
-                    temp_df.loc[temp]['imputed_stderr'],
+                    rectifier_mean,
+                    rectifier_se,
+                    imputed_mean,
+                    imputed_se,
                     null=target_val,
                     alternative='larger'
                 )
@@ -534,17 +641,20 @@ def run_temperature_selection_experiments(
                 # Bonferroni correction
                 if imp_pval < alpha / target_values.size:
                     df.loc[target_val]['tr{}_imp_selected_temp{:.4f}'.format(i, temp)] = 1
-                    # print('    Imputation selected temp = {:.4f}'.format(temp))
                 else:
                     df.loc[target_val]['tr{}_imp_selected_temp{:.4f}'.format(i, temp)] = 0
 
                 if pp_pval < alpha / target_values.size:
                     df.loc[target_val]['tr{}_pp_selected_temp{:.4f}'.format(i, temp)] = 1
-                    # print('    PP selected temp = {:.4f}'.format(temp))
                 else:
                     df.loc[target_val]['tr{}_pp_selected_temp{:.4f}'.format(i, temp)] = 0
-        if (i + 1) % print_every == 0:
-            print('Done with {} / {} trials. {} s'.format(i + 1, n_trial, int(time() - t0)))
+                    
+        print('Done running {} / {} trials for temperature {:.4f} ({} / {}) ({} s).\n'.format(
+            n_trial, n_trial, temp, t + 1, len(temperatures), int(time() - t0)
+        ))
+        if results_csv_fname is not None:
+            df.to_csv(results_fname) # time sink
+            print('Saved to {} ({} s).'.format(results_fname, int(time() - t0)))
 
-    return temp_df, df
+    return df
 

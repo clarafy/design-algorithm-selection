@@ -146,18 +146,6 @@ def ppi_mean_pval(
                 grads, grads_hat, grads_hat_unlabeled, inv_hessian, coord=None
             )
 
-    # print('pp point estimate, lhat, rectifier std, imputed std, label std, unweighted rect std, unweighted rect std w/ lhat:')
-    # print('{:.4f} {:.4f} {:.4f} {:.4f}, {:.4f} {:.4f} {:.4f}'.format(
-    #     (w_unlabeled * lhat * Yhat_unlabeled).mean() + (w * Y - lhat * w * Yhat).mean(),
-    #     lhat,
-    #     (w * Y - lhat * w * Yhat).std() / np.sqrt(n),
-    #     (w_unlabeled * lhat * Yhat_unlabeled).std() / np.sqrt(N),
-    #     Y.std() / np.sqrt(n),
-    #     (Y - Yhat).std() / np.sqrt(n),
-    #     (Y - lhat * Yhat).std() / np.sqrt(n)
-    #     ))
-    # print('lhat: {:.3f}'.format(lhat))
-
     return rectified_p_value(
         (w * Y - lhat * w * Yhat).mean(),
         (w * Y - lhat * w * Yhat).std() / np.sqrt(n),
