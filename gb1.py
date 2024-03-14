@@ -1,22 +1,18 @@
 from pathlib import Path
 import os.path
-import copy
 from itertools import product
 
 from time import time
-from tqdm import tqdm
 import numpy as np
 from pandas import DataFrame, read_csv
 from Bio.Seq import Seq
 from statsmodels.stats.weightstats import _zstat_generic
-from sklearn.linear_model import LogisticRegression
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
+from models import EnrichmentFeedForward, ExceedancePredictor
 
 import utils
 from calibrate import rectified_p_value
 
+# TODO: move constants to a util.py if rna.py also has
 AA2CODON = {
         'l': ['tta', 'ttg', 'ctt', 'ctc', 'cta', 'ctg'],
         's': ['tct', 'tcc', 'tca', 'tcg', 'agt', 'agc'],
@@ -57,186 +53,6 @@ y_n = df['log_fitness'].to_numpy()
 var_n = df['estimated_variance'].to_numpy()
 SEQ2YVAR = {seq: [y, var] for seq, y, var in zip(seq_n, y_n, var_n)}
 assert(set(seq_n) == set(ALL_NOSTOP_AA_SEQS))
-
-# ===== models for predicting enrichment from sequence =====
-
-def type_check_and_one_hot_encode_sequences(seq_n, alphabet, verbose: bool = False):
-    if isinstance(seq_n[0], str):
-        t0 = time()
-        ohe_nxla = np.stack([utils.str2onehot(seq, alphabet).flatten() for seq in seq_n])
-        if verbose:
-            print('One-hot encoded sequences to shape = {} ({} sec)'.format(ohe_nxla.shape, int(time() - t0)))
-
-    elif type(seq_n[0]) is np.ndarray:
-        if verbose:
-            print('Sequences are already one-hot encoded.')
-        if len(seq_n.shape) == 2:
-            # assume seq_n is already shaped like ohe_nxla
-            ohe_nxla = seq_n.copy()
-        elif len(seq_n.shape) == 3:
-            # assume seq_n is shaped like ohe_nxlxa
-            shape = seq_n.shape
-            ohe_nxla = np.reshape(seq_n, [shape[0], shape[1] * shape[2]])
-        else:
-            raise ValueError('seq_n has shape {} with length {}, unclear how to reshape.'.format(seq_n.shape, len(seq_n.shape)))
-        
-    else:
-        raise ValueError('Unrecognized seq_n type: {} is type {}'.format(seq_n[0], type(seq_n[0])))
-    return ohe_nxla
-
-class ExceedancePredictor():
-    def __init__(self, model, threshold: float) -> None:
-        self.model = model
-        self.threshold = threshold
-        self.lr = LogisticRegression(class_weight='balanced')
-        self.lr_fitted = False
-
-    def fit(self, ohe_nxlxa: np.array, binary_y_n: np.array):
-        pred_n = self.model.predict(ohe_nxlxa)
-        self.lr.fit(pred_n[:, None], binary_y_n)
-        self.lr_fitted = True
-
-    def predict(self, ohe_nxlxa: np.array):
-        if not self.lr_fitted:
-            # print('Warning: ExceedancePredictor has not been fit. Making predictions by thresholding.')
-            return (self.model.predict(ohe_nxlxa) >= self.threshold).astype(float)
-        return self.lr.predict_proba(self.model.predict(ohe_nxlxa)[:, None])[:, 1]
-
-class EnrichmentFeedForward(torch.nn.Module):
-    def __init__(
-         self,
-            seq_len: int = 4,
-            alphabet: str = AA,
-            n_hidden: int = 10,
-            n_model: int = 3,
-            device = None,
-            dtype = torch.float
-    ):
-        super().__init__()
-
-        self.seq_len = seq_len
-        self.alphabet = alphabet
-        self.input_sz = seq_len * len(alphabet)
-        self.device = device
-        self.dtype = dtype
-
-        self.models = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.input_sz, n_hidden),
-                nn.ReLU(), 
-                nn.Linear(n_hidden, n_hidden),
-                nn.ReLU(),
-                nn.Linear(n_hidden, 1),
-            )
-        for _ in range(n_model)])
-        self.models.to(device, dtype=dtype)
-        
-    def forward(self, tX_nxla):
-        pred_nxm = torch.cat([model(tX_nxla) for model in self.models], dim=1)
-        return torch.mean(pred_nxm, dim=1, keepdim=False)
-    
-    def weighted_mse_loss(self, y_b, pred_b, weight_b):
-        return torch.mean(weight_b * (y_b - pred_b) ** 2)
-    
-    def fit(
-        self,
-        seq_n,
-        y_nx2: np.array,
-        batch_size: int = 64,
-        n_epoch: int = 5,
-        lr: float = 0.001,
-        val_frac: float = 0.1,
-        n_data_workers: int = 1
-    ):
-        if val_frac < 0:
-            raise ValueError('val_frac = {} must be positive.'.format(val_frac))
-        
-        if len(y_nx2.shape) == 1:
-            print('No fitness variance estimates provided. Using unweighted MSE loss.')
-            y_nx2 = np.hstack([y_nx2[:, None], 0.5 * np.ones([len(seq_n), 1])])
-
-        ohe_nxla = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=True)
-        dataset = [(ohe_la, y_mean_var[0], y_mean_var[1]) for ohe_la, y_mean_var in zip(ohe_nxla, y_nx2)]
-
-        # split into training and validation
-        shuffle_idx = np.random.permutation(len(dataset))
-        n_val = int(val_frac * len(dataset))
-        n_train = len(dataset) - n_val
-        train_dataset = [dataset[i] for i in shuffle_idx[: n_train]]
-        val_dataset = [dataset[i] for i in shuffle_idx[n_train :]]
-        assert(len(val_dataset) == n_val)
-        print('{} training data points, {} validation data points.'.format(n_train, n_val))
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_data_workers)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=n_data_workers)
-        
-        optimizer = torch.optim.Adam(self.models.parameters(), lr=lr)
-        loss_tx2 = np.zeros([n_epoch, 2])
-        best_val_loss = np.inf
-        best_model_parameters = None
-        for t in range(n_epoch):
-            
-            t0 = time()
-
-            # validation loss
-            self.requires_grad_(False)
-            total_val_loss = 0.
-            for _, data in enumerate(tqdm(val_loader)):
-                tX_bxla, tymean_b, tyvar_b = data
-                tX_bxla = tX_bxla.to(device=self.device, dtype=self.dtype)
-                tymean_b = tymean_b.to(device=self.device, dtype=self.dtype)
-                tyvar_b = tyvar_b.to(device=self.device, dtype=self.dtype)
-
-                pred_b = self(tX_bxla)
-                loss = self.weighted_mse_loss(tymean_b, pred_b, 1 / (2 * tyvar_b))
-                total_val_loss += loss.item() * tX_bxla.shape[0]
-            total_val_loss /= n_val
-
-            if total_val_loss < best_val_loss:
-                best_val_loss = total_val_loss
-                best_model_parameters = copy.deepcopy(self.state_dict())
-
-            # gradient step on training loss
-            self.requires_grad_(True)
-            total_train_loss = 0.
-            for _, data in enumerate(tqdm(train_loader)):
-                tX_bxla, tymean_b, tyvar_b = data
-                tX_bxla = tX_bxla.to(device=self.device, dtype=self.dtype)
-                tymean_b = tymean_b.to(device=self.device, dtype=self.dtype)
-                tyvar_b = tyvar_b.to(device=self.device, dtype=self.dtype)
-
-                optimizer.zero_grad()
-
-                pred_b = self(tX_bxla)
-
-                loss = self.weighted_mse_loss(tymean_b, pred_b, 1 / (2 * tyvar_b))
-                loss.backward()
-
-                optimizer.step()
-                total_train_loss += loss.item() * tX_bxla.shape[0]
-
-            total_train_loss /= n_train
-            loss_tx2[t] = total_train_loss, total_val_loss
-            print('Epoch {}. Train loss: {:.2f}. Val loss: {:.2f}. {} sec.'.format(t, total_train_loss, total_val_loss, int(time() - t0)))
-        
-        self.load_state_dict(best_model_parameters)
-        self.requires_grad_(False)
-        return loss_tx2
-
-    def predict(self, seq_n, verbose: bool = False):
-        ohe_nxla = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
-        tohe_nxla = torch.from_numpy(ohe_nxla).to(device=self.device, dtype=self.dtype)
-        return self(tohe_nxla).cpu().detach().numpy()
-    
-    def save(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-models'):
-        Path(save_path).mkdir(parents=True, exist_ok=True)
-        fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
-        torch.save(self.state_dict(), fname)
-        print('Saved models to {}.'.format(fname))
-    
-    def load(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-models'):
-        fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
-        self.load_state_dict(torch.load(fname))
-
 
 # ===== sampling sequences from design distribution =====
         
@@ -649,12 +465,12 @@ def run_temperature_selection_experiments(
                 else:
                     df.loc[target_val]['tr{}_pp_selected_temp{:.4f}'.format(i, temp)] = 0
                     
-        print('Done running {} / {} trials for temperature {:.4f} ({} / {}) ({} s).\n'.format(
+        print('Done running {} / {} trials for temperature {:.4f} ({} / {}) ({} s).'.format(
             n_trial, n_trial, temp, t + 1, len(temperatures), int(time() - t0)
         ))
         if results_csv_fname is not None:
             df.to_csv(results_fname) # time sink
-            print('Saved to {} ({} s).'.format(results_fname, int(time() - t0)))
+            print('Saved to {} ({} s).\n'.format(results_fname, int(time() - t0)))
 
     return df
 
