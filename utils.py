@@ -6,6 +6,17 @@ import flexs.utils.sequence_utils as s_utils
 
 import editdistance
 
+RNA_NUCLEOTIDES = 'UGCA'
+
+# ==========
+
+def get_mutant(seq, p_mut, alphabet):
+    mutprobs_axa = (p_mut / (len(alphabet) - 1)) * np.ones((len(alphabet), len(alphabet)))
+    mutprobs_axa[np.diag_indices(len(alphabet), ndim=2)] = 1 - p_mut
+    token2mutprobs = {token: mutprobs_axa[i] for i, token in enumerate(alphabet)}
+    alphabet_list = list(alphabet)
+    return ''.join([np.random.choice(alphabet_list, p=token2mutprobs[token]) for token in seq])
+
 def str2onehot(sequence: str, alphabet: str) -> np.ndarray:
     out = np.zeros((len(sequence), len(alphabet)))
     for i in range(len(sequence)):

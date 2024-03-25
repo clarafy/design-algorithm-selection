@@ -424,7 +424,7 @@ def run_temperature_selection_experiments(
             # ----- quantities for prediction-powered hypothesis test -----
             # density ratios on labeled calibration sequences
             caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa, logptrain_n=callogptrain_n)
-            cal_ess = np.square(np.sum(caldr_n)) / np.sum(np.square(caldr_n))
+            # cal_ess = np.square(np.sum(caldr_n)) / np.sum(np.square(caldr_n))
             if self_normalize_weights:
                 caldr_n = caldr_n / np.sum(caldr_n) * caldr_n.size
         

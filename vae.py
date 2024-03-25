@@ -8,19 +8,17 @@ from torch.utils.data import DataLoader
 
 from pandas import DataFrame
 import numpy as np
-import scipy as sc
 
 from models import type_check_and_one_hot_encode_sequences
-from rna import RNA_NUCLEOTIDES
+from utils import RNA_NUCLEOTIDES
 
 class VAE(nn.Module):
     def __init__(
             self,
             seq_len: int = 50,
             alphabet: str = RNA_NUCLEOTIDES,
-            latent_dim: int = 20,
-            n_enc_hidden: int = 50,
-            n_dec_hidden: int = 50,
+            latent_dim: int = 10,
+            n_hidden: int = 20,
             device = None,
             dtype = torch.float
         ):
@@ -32,22 +30,22 @@ class VAE(nn.Module):
 
         self.encoder = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(self.seq_len * len(self.alphabet), n_enc_hidden),
+            nn.Linear(self.seq_len * len(self.alphabet), n_hidden),
             nn.ReLU(),
-            nn.Linear(n_enc_hidden, n_enc_hidden),
+            nn.Linear(n_hidden, n_hidden),
             nn.ReLU(),
         )
 
         # latent mean and variance 
-        self.mean_layer = nn.Linear(n_enc_hidden, latent_dim)
-        self.logvar_layer = nn.Linear(n_enc_hidden, latent_dim)
+        self.mean_layer = nn.Linear(n_hidden, latent_dim)
+        self.logvar_layer = nn.Linear(n_hidden, latent_dim)
 
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, n_dec_hidden),
+            nn.Linear(latent_dim, n_hidden),
             nn.ReLU(),
-            nn.Linear(n_dec_hidden, n_dec_hidden),
+            nn.Linear(n_hidden, n_hidden),
             nn.ReLU(),
-            nn.Linear(n_dec_hidden, self.seq_len * len(self.alphabet)),
+            nn.Linear(n_hidden, self.seq_len * len(self.alphabet)),
             nn.Unflatten(dim=1, unflattened_size=(self.seq_len, len(self.alphabet))),
         )
         self.encoder.to(device)
@@ -80,12 +78,16 @@ class VAE(nn.Module):
         kl_n =  -0.5 * torch.sum(1 + logvar_nxd - torch.pow(mu_nxd, 2) - torch.exp(logvar_nxd), dim=1)
         return torch.sum(weight_n * kl_n)
     
-    def generate(self, n_sample):
-        z_nxd = np.random.randn(n_sample, self.latent_dim)
+    def decode_probabilities(self, z_nxd: np.array):
         tz_nxd = torch.from_numpy(z_nxd).to(self.device, self.dtype)
         logits_nxlxa =  self.decoder(tz_nxd)
         p_nxlxa = torch.softmax(logits_nxlxa, dim=2)
         p_nxlxa = p_nxlxa.detach().cpu().numpy()
+        return p_nxlxa
+    
+    def generate(self, n_sample):
+        z_nxd = np.random.randn(n_sample, self.latent_dim)
+        p_nxlxa = self.decode_probabilities(z_nxd)
 
         if (
             np.isnan(p_nxlxa).any()
@@ -101,7 +103,7 @@ class VAE(nn.Module):
             seq = ''.join(seq)
             seq_n.append(seq)
 
-        return seq_n
+        return seq_n, p_nxlxa, z_nxd
 
 
     def fit(
@@ -113,12 +115,13 @@ class VAE(nn.Module):
         n_epoch: int = 10,
         val_frac: float = 0.1,
         n_data_workers: int = 1,
+        verbose: bool = False
     ):
         if weight_n is None:
             weight_n = np.ones([len(seq_n)])
         assert(weight_n.size == len(seq_n))
         weight_n = weight_n * weight_n.size / np.sum(weight_n)
-        ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=True)
+        ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
         dataset = [(ohe_lxa, w) for ohe_lxa, w in  zip(ohe_nxlxa, weight_n)]
 
         # split into training and validation
@@ -128,7 +131,8 @@ class VAE(nn.Module):
         train_dataset = [dataset[i] for i in shuffle_idx[: n_train]]
         val_dataset = [dataset[i] for i in shuffle_idx[n_train :]]
         assert(len(val_dataset) == n_val)
-        print('{} training data points, {} validation data points.'.format(n_train, n_val))
+        if verbose:
+            print('{} training data points, {} validation data points.'.format(n_train, n_val))
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_data_workers)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=n_data_workers)
         
@@ -154,10 +158,9 @@ class VAE(nn.Module):
                 logits_bxlxa, mu_bxd, logvar_bxd = self(X_bxlxa)
 
                 logits_bxaxl = torch.transpose(logits_bxlxa, dim0=1, dim1=2)
-                assert(logits_bxaxl.shape == (batch_size, len(self.alphabet), self.seq_len))
+                assert(logits_bxaxl.shape[1 :] == (len(self.alphabet), self.seq_len))
                 idx_bxl = torch.argmax(X_bxlxa, axis=2)
                 reconstruction_loss_bxl = nn.functional.cross_entropy(logits_bxaxl, idx_bxl, reduction='none')
-                assert(reconstruction_loss_bxl.shape[0] == batch_size)
                 assert(reconstruction_loss_bxl.shape[1] == self.seq_len)
                 reconstruction_loss = torch.sum(w_b * torch.sum(reconstruction_loss_bxl, dim=1))
 
@@ -208,13 +211,14 @@ class VAE(nn.Module):
             loss_df_columns.append(
                 [total_train_loss, total_train_kl_loss, total_train_recon_loss, total_val_loss, total_val_kl_loss, total_val_recon_loss]
             )
-            print(
-                print_format_str.format(
-                    t, total_train_loss, total_train_kl_loss, total_train_recon_loss,
-                    total_val_loss, total_val_kl_loss, total_val_recon_loss, 
-                    int(time() - t0)
+            if verbose:
+                print(
+                    print_format_str.format(
+                        t, total_train_loss, total_train_kl_loss, total_train_recon_loss,
+                        total_val_loss, total_val_kl_loss, total_val_recon_loss, 
+                        int(time() - t0)
+                    )
                 )
-            )
         
         self.load_state_dict(best_model_parameters)
         self.requires_grad_(False)

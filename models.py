@@ -5,6 +5,7 @@ import os.path
 from pathlib import Path
 
 import numpy as np
+import scipy as sc
 from sklearn.linear_model import LogisticRegression, RidgeCV, LinearRegression
 import torch
 from torch import nn
@@ -317,6 +318,15 @@ class TorchRegressorEnsemble(torch.nn.Module):
         tohe_nxlxa = torch.from_numpy(ohe_nxlxa).to(device=self.device, dtype=self.dtype)
         return self(tohe_nxlxa).cpu().detach().numpy()
     
+    def predict_prob_exceedance(self, seq_n, threshold: float, verbose: bool = False):
+        ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
+        tohe_nxlxa = torch.from_numpy(ohe_nxlxa).to(device=self.device, dtype=self.dtype)
+        pred_nxm = torch.cat([model(tohe_nxlxa) for model in self.models], dim=1).detach().cpu().numpy()
+        pred_n = np.mean(pred_nxm, axis=1)
+        var_n = np.var(pred_nxm, axis=1)
+        pexceed_n = sc.stats.norm.sf(threshold, loc=pred_n, scale=np.sqrt(var_n))
+        return pexceed_n
+    
     def save(self, save_fname):
         torch.save(self.state_dict(), save_fname)
         print('Saved models to {}.'.format(save_fname))
@@ -397,17 +407,40 @@ class SklearnRegressor():
         self.model = model
         self.seq_len = seq_len
         self.alphabet = alphabet
+        self.mse = None
+        self.model_fitted = False
 
-    def fit(self, seq_n, y_n, verbose: bool = False):
+    def fit(self, seq_n, y_n, val_frac: float = 0.1, verbose: bool = False):
         ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
         ohe_nxla = np.reshape(ohe_nxlxa, [len(seq_n), ohe_nxlxa.shape[1] * ohe_nxlxa.shape[2]])
-        self.model.fit(ohe_nxla, y_n)
+
+        shuffle_idx = np.random.permutation(len(seq_n))
+        n_val = int(val_frac * len(seq_n))
+        n_train = len(seq_n) - n_val
+        train_idx, val_idx = shuffle_idx[: n_train], shuffle_idx[n_train :]
+
+        self.model.fit(ohe_nxla[train_idx], y_n[train_idx])
+        predval_n = self.model.predict(ohe_nxla[val_idx])
+        self.mse = np.mean(np.square(y_n[val_idx] - predval_n))
+        self.model_fitted = True
 
     def predict(self, seq_n, verbose: bool = False):
+        if not self.model_fitted:
+            raise ValueError(
+                'This SklearnRegressor instance is not fitted yet. Call `fit` with appropriate arguments.'
+            )
         ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
         ohe_nxla = np.reshape(ohe_nxlxa, [len(seq_n), ohe_nxlxa.shape[1] * ohe_nxlxa.shape[2]])
         return self.model.predict(ohe_nxla)
     
+    def predict_prob_exceedance(self, seq_n, threshold: float, verbose: bool = False):
+        if not self.model_fitted:
+            raise ValueError(
+                'This SklearnRegressor instance is not fitted yet. Call `fit` with appropriate arguments.'
+            )
+        pred_n = self.predict(seq_n, verbose=verbose)
+        pexceed_n = sc.stats.norm.sf(threshold, loc=pred_n, scale=np.sqrt(self.mse))
+        return pexceed_n
 
 class RidgeRegressor(SklearnRegressor):
     def __init__(self, seq_len: int, alphabet: str, alphas = None):
