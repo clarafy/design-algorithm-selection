@@ -1,5 +1,8 @@
-from abc import ABC, abstractmethod
 import copy
+from tqdm import tqdm
+from time import time
+import re
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -7,191 +10,431 @@ import pandas as pd
 import torch
 from torch import nn
 
-
-class DensityRatioEstimator(ABC):
-    def __init__(self):
-        pass
-
-    @abstractmethod
-    def fit(self, Xtrain_nxp: np.array, ytrain_n: np.array, Xtest_mxp: np.array, ytest_m: np.array):
-        pass
-
-    @abstractmethods
-    def predict(self, Xnew_nxp):
-        pass
+from models import type_check_and_one_hot_encode_sequences
+from utils import RNA_NUCLEOTIDES
 
 
-def fit_dr_estimator(cfg, dr_estimator, Xsource_xp, Xtarget_xp, val_frac: float = 0):
-    tXsource_xp = torch.Tensor(Xsource_xp)
-    tXtarget_xp = torch.Tensor(Xtarget_xp)
-    n_source = tXsource_xp.shape[0]
-    n_target = tXtarget_xp.shape[0]
+class MultiMDRE():
 
-    zsource = torch.zeros((n_source), 1, device=dr_estimator.device)
-    ztarget = torch.ones((n_target), 1, device=dr_estimator.device)
-    cat_X = torch.cat([tXsource_xp, tXtarget_xp])
-    cat_Z = torch.cat([zsource, ztarget])
+    def __init__(self, group_regex_strs, device = None):
+        self.group_regex_strs = group_regex_strs
+        self.group_regex = [re.compile(s) for s in group_regex_strs]
+        self.n_groups = len(self.group_regex)
+        self.idx2mdre = {}
+        self.idx2lossdf = {}
+        self.device = device
 
-    if val_frac:
-        n_val = int(0.1 * cat_X.shape[-2])
-        rand_perm = np.random.permutation(cat_X.shape[-2])
-        Xval_xp = cat_X[rand_perm[:n_val]]
-        Zval_x1 = cat_Z[rand_perm[:n_val]]
-        Xtrain_nxp = cat_X[rand_perm[n_val:]]
-        Ztrain_nx1 = cat_Z[rand_perm[n_val:]]
-    else:
-        n_val = 0
-        Xtrain_nxp = cat_X
-        Ztrain_nx1 = cat_Z
-        Xval_xp = None
-        Zval_x1 = None
+    def _name2idx(self, name):
+        for i, regex in enumerate(self.group_regex):
+            if regex.match(name) is not None:
+                return i
+        raise ValueError(f'{name} does not match any of the group regexs.')
 
-    emp_ratio = n_source / n_target  # TODO: estimate on all data including validation?
-    dr_estimator._ratio = emp_ratio  # TODO: this whole function should be class method
-    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([emp_ratio]))  # TODO: proper score?
-    dr_estimator.requires_grad_(True)
-    optimizer = torch.optim.Adam(
-        dr_estimator.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'],
-    )
-    lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['num_grad_steps'])
+    def fit(
+            self,
+            name2designdata,
+            seq_len: int = 50,
+            n_hidden = 256,
+            n_epoch = 500,
+            verbose: bool = False
+        ):
 
-    best_loss = float('inf')
-    losses = []
-    val_loss = 0
+        assert('train' in name2designdata)
+        idx2group = {
+            i: {'train': name2designdata['train']} for i in range(self.n_groups)
+        }
 
-    for _ in range(cfg['num_grad_steps']):
-        if n_val:
-            with torch.no_grad():
-                val_logits = dr_estimator.classifier(Xval_xp)
-                val_loss = loss_fn(val_logits, Zval_x1)
+        # assign each design algorithm to its group
+        for name, data in name2designdata.items():
+            if name != 'train':
+                group_idx = self._name2idx(name)
+                assert(name not in idx2group[group_idx])
+                idx2group[group_idx][name] = data
 
-        dr_estimator.zero_grad()
-        Xaug_nxp = Xtrain_nxp + cfg['noise_aug_scale'] * torch.randn_like(Xtrain_nxp)
-        train_logits = dr_estimator.classifier(Xaug_nxp)
-        train_loss = loss_fn(train_logits, Ztrain_nx1)
+        # fit MDRE per group
+        for i, name2dd in idx2group.items():
+            group_str = self.group_regex_strs[i]
 
-        if n_val and val_loss < best_loss:
-            best_loss = val_loss.item()
-            best_weights = copy.deepcopy(dr_estimator.state_dict())
-            ckpt_train_loss = train_loss.item()
-        elif train_loss < best_loss:
-            best_loss = train_loss.item()
-            best_weights = copy.deepcopy(dr_estimator.state_dict())
-            ckpt_train_loss = train_loss.item()
+            # if no design algorithms were assigned to this group, raise error
+            if len(name2dd) == 1:
+                assert('train' in name2dd)
+                raise ValueError('Group {} has no design algorithms in name2designdata.'.format(group_str))
+            
+            if verbose:
+                print('Fitting MDRE for {}, which has {} design algorithms:'.format(group_str, len(name2dd) - 1))
+                for name in name2dd:
+                    print(name)
 
-        train_loss.backward()
-        optimizer.step()
-        lr_sched.step()
-        losses.append([ckpt_train_loss, val_loss])
+            mdre = MultinomialLogisticRegresssionDensityRatioEstimator(
+                seq_len=seq_len,
+                n_distribution=len(name2dd),
+                n_hidden=n_hidden,
+                device=self.device,
+            )
+            loss_df = mdre.fit(name2dd, n_epoch=n_epoch, verbose=verbose)
+            if verbose:
+                print('Min train loss {:.2f}, min val loss {:.2f}'.format(
+                    np.min(loss_df["train_loss"]), np.min(loss_df["val_loss"])
+                ))
+                print()
+            self.idx2mdre[i] = mdre
+            self.idx2lossdf[i] = loss_df
+            
 
-    dr_estimator.load_state_dict(best_weights)
-    dr_estimator.requires_grad_(False)
-    dr_estimator.update_target_network()
+    def get_dr(
+            self,
+            calseq_n,
+            design_name: str,
+            self_normalize: bool = True,
+            verbose: bool = False
+        ):
+        # get group index of this design algorithm
+        group_idx = self._name2idx(design_name)
+        if verbose:
+            print('{} belongs to group {}'.format(design_name, self.group_regex_strs[group_idx]))
+        
+        # get estimated DRs from corresponding group MDRE
+        designname2dr = self.idx2mdre[group_idx].get_dr(calseq_n, self_normalize=self_normalize)
+        dr_n = designname2dr[design_name]
+        return dr_n
 
-    metrics = dict(
-        dre_best_loss=best_loss,
-        dre_last_train_loss=train_loss.item()
-    )
-    df = pd.DataFrame(losses, columns=["train_loss", "val_loss"])
-
-    if n_val:
-        tgt_network = dr_estimator._target_network
-        tgt_logits = tgt_network(Xval_xp)
-        metrics['dre_tgt_loss'] = loss_fn(tgt_logits, Zval_x1).item()
-    return metrics, df
-
-
-class Quadratic(nn.Module):
-    def __init__(self, in_size):
+    
+class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
+    def __init__(
+            self,
+            seq_len: int,
+            n_distribution: int,  # including train distribution
+            n_hidden: int,
+            alphabet: str = RNA_NUCLEOTIDES,
+            device = None,
+            dtype = torch.float,
+        ):
         super().__init__()
-        self.W = torch.nn.Parameter(torch.randn((in_size, in_size)))
-        self.b = torch.nn.Parameter(torch.randn(()))
 
-    def forward(self, x):
-        return torch.matmul(torch.matmul(x.T, self.W), x) + self.b
+        self.model = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(seq_len * len(alphabet), n_hidden),
+            nn.ReLU(),
+            nn.Dropout(p=0.5),
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Dropout(p=0.5),
+            nn.Linear(n_hidden, n_distribution),
+        )
+        self.model.to(device=device, dtype=dtype)
 
-
-
-class RatioEstimator(nn.Module):
-
-    def __init__(self, in_size, n_hidden: int = 16, device=None, dtype=None, ema_weight=1e-2, lr=1e-3, weight_decay=1e-4):
-        super().__init__()
+        self.alphabet = alphabet
+        self.n_distribution = n_distribution
+        self.designname2idx = None
 
         self.device = device
         self.dtype = dtype
-        self.in_size = in_size
 
-        # self.classifier = nn.Sequential(
-        #     nn.Linear(in_size, n_hidden),
-        #     nn.ReLU(),
-        #     nn.Linear(n_hidden, n_hidden),
-        #     nn.ReLU(),
-        #     nn.Linear(n_hidden, 1),
-        # ).to(device=device, dtype=dtype)
+        self.numer_kd_m = []
+        self.denom_kd_m = []
 
-        self.classifier = nn.Sequential(
-            Quadratic(in_size),
-        ).to(device=device, dtype=dtype)
+    def fit(
+            self,
+            designname2data: dict,
+            n_epoch: int,
+            lr: float = 1e-3,
+            val_frac: float = 0.1,
+            weight_loss: bool = True,
+            verbose: bool = True,
+        ):
 
-        # density ratio estimates are exactly 1 when untrained
-        self._target_network = copy.deepcopy(self.classifier)
-        self._target_network.requires_grad_(False)
-        for tgt_p in self._target_network.parameters():
-            tgt_p.data.fill_(0.)
-        self._ema_weight = ema_weight
-        self._ratio = None
+        names = list(designname2data.keys())
+        assert('train' in names)
+        assert(len(names) == self.n_distribution)
+        names.remove('train')
+        names.sort()
+        names = ['train'] + names  # convention will be that train distribution is category 0
+        self.designname2idx = {name: i for i, name in enumerate(names)}
+        
+        # for training convenience, convert `designname2seqs`,
+        # a dictionary that maps design name (e.g., 'adalead0.1-ridge') to tuple (sequences, labels, predictions),
+        # to `tX_nxlxa_m`, a list of one-hot-encoded sequence representations.
+        # `self.designname2idx[name]` gives the index i such that
+        # tX_nxlxa_m[i] gives the sequence representations corresponding to `name`.
+        tX_nxlxa_m = []
+        if verbose:
+            print('One-hot-encoding all {} categories of sequences...'.format(self.n_distribution))
+        t0 = time()
+        for name in names:
+            X_nxlxa = type_check_and_one_hot_encode_sequences(designname2data[name][0], self.alphabet)
+            X_nxlxa = X_nxlxa[np.random.permutation(X_nxlxa.shape[0])]
+            tX_nxlxa_m.append(torch.from_numpy(X_nxlxa).to(device=self.device, dtype=self.dtype))
+        if verbose:
+            print('  Done. ({} s)'.format(int(time() - t0)))
+        
+        if val_frac > 0:
+            Xtr_nxd_m = []
+            ztr_n_m = []  # categorical labels for the different design distributions
+            Xval_nxd_m = []
+            zval_n_m = []
+            for k, X_nxlxa in enumerate(tX_nxlxa_m):
+                n = X_nxlxa.shape[0]
+                n_val = int(val_frac * n)
 
-        self.criterion = torch.nn.BCEWithLogitsLoss()
-        self.optim = torch.optim.Adam(self.classifier.parameters(), lr=lr, weight_decay=weight_decay)
+                Xtr_nxd_m.append(X_nxlxa[n_val :])
+                ztr_n_m.append(
+                    k * torch.ones((X_nxlxa[n_val :].shape[0]), device=self.device, dtype=torch.int64)
+                )
 
-    def forward2(self, inputs):
-        _p = torch.exp(self._target_network(inputs).squeeze(-1))
-        return _p
+                Xval_nxd_m.append(X_nxlxa[: n_val])
+                zval_n_m.append(
+                    k * torch.ones((X_nxlxa[: n_val].shape[0]), device=self.device, dtype=torch.int64)
+                )
+            
+            Xtr_mnxd = torch.cat(Xtr_nxd_m, dim=0)
+            ztr_mn = torch.cat(ztr_n_m, dim=0)
+            Xval_mnxd = torch.cat(Xval_nxd_m, dim=0)
+            zval_mn = torch.cat(zval_n_m, dim=0)
 
-    def forward(self, inputs):
-        _p = self._target_network(inputs).squeeze(-1).sigmoid()
-        return self._ratio * _p.clamp_max(1 - 1e-6) / (1 - _p).clamp_min(1e-6)
+            if weight_loss:
+                # weights for training data
+                n_tr = Xtr_nxd_m[0].shape[0]  # train distribution is category 0
+                N_tr = Xtr_nxd_m[1].shape[0]
 
-    def update_target_network(self):
-        with torch.no_grad():
-            for src_p, tgt_p in zip(
-                    self.classifier.parameters(), self._target_network.parameters()
-            ):
-                tgt_p.mul_(1. - self._ema_weight)
-                tgt_p.add_(self._ema_weight * src_p)
+                # assume all design distributions have same amount of data
+                for k in range(2, self.n_distribution):
+                    assert(Xtr_nxd_m[k].shape[0] == N_tr)
 
-    def optimize_callback(self, xk):
-        if isinstance(xk, np.ndarray):
-            xk = torch.from_numpy(xk)
-        xk = xk.reshape(-1, self.in_size)
-        self._pos_samples.extend([x for x in xk])
+                w_tr_train = self.n_distribution / ((self.n_distribution - 1) * (n_tr / N_tr) + 1)
+                w_tr_design = (n_tr / N_tr) * w_tr_train
 
-        if self._neg_samples is None:
+                wtr_m = w_tr_design * torch.ones((self.n_distribution), device=self.device, dtype=self.dtype)
+                wtr_m[0] = w_tr_train
+
+                # weights for validation data
+                n_val = Xval_nxd_m[0].shape[0]
+                N_val = Xval_nxd_m[1].shape[0]
+
+                # assume all design distributions have same amount of data
+                for k in range(2, self.n_distribution):
+                    assert(Xval_nxd_m[k].shape[0] == N_val)
+                
+                w_val_train = self.n_distribution / ((self.n_distribution - 1) * (n_val / N_val) + 1)
+                w_val_design = (n_val / N_val) * w_val_train
+
+                wval_m = w_val_design * torch.ones((self.n_distribution), device=self.device, dtype=self.dtype)
+                wval_m[0] = w_val_train
+            else:
+                wtr_m = wval_m = None
+
+        else:
+            raise ValueError('No validation data for density ratio estimation.')
+            Xval_mnxd, zval_mn = None, None
+            # TODO: implement Xtr_mnxd, ztr_mn
+
+        val_loss_fn = torch.nn.CrossEntropyLoss(weight=wval_m)
+        tr_loss_fn = torch.nn.CrossEntropyLoss(weight=wtr_m)
+        self.model.requires_grad_(True)
+        optim = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        best_loss = float('inf')
+        val_loss = 0
+        ckpt_losses = []
+
+        self.model.train()
+        epochs = range(n_epoch)
+        if verbose:
+            epochs = tqdm(epochs)
+        for _ in epochs:
+            if val_frac > 0:
+                with torch.no_grad():
+                    self.model.eval()
+                    vallogits = self.model(Xval_mnxd)
+                    val_loss = val_loss_fn(vallogits, zval_mn)
+                    self.model.train()
+
+            self.model.zero_grad()
+            trlogits = self.model(Xtr_mnxd)
+            train_loss = tr_loss_fn(trlogits, ztr_mn)
+
+            if val_frac > 0 and val_loss < best_loss:
+                best_loss = val_loss.item()
+                best_weights = copy.deepcopy(self.model.state_dict())
+            elif train_loss < best_loss:
+                best_loss = train_loss.item()
+                best_weights = copy.deepcopy(self.model.state_dict())
+
+            train_loss.backward()
+            optim.step()
+            ckpt_losses.append([
+                train_loss.item(),
+                val_loss.item() if n_val else val_loss,
+            ])
+        self.model.eval()
+
+        self.model.load_state_dict(best_weights)
+        self.model.requires_grad_(False)
+        df = pd.DataFrame(ckpt_losses, columns=["train_loss", "val_loss"])
+        return df
+
+    def forward(self, tX_nxp: torch.Tensor):
+        return self.model(tX_nxp)
+
+    def get_dr(self, seq_n: np.array, self_normalize: bool = True):
+        X_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet)
+        tX_nxlxa = torch.from_numpy(X_nxlxa).to(device=self.device, dtype=self.dtype)
+
+        th_nxm = self(tX_nxlxa)
+        # train distribution is category 0
+        ldr_nxm = (th_nxm[:, 1 :] - th_nxm[:, 0][:, None]).cpu().detach().numpy()
+    
+        if self_normalize:
+            c_1xm = np.max(ldr_nxm, axis=0, keepdims=True)
+            normalization_1xm = c_1xm + np.log(np.sum(np.exp(ldr_nxm - c_1xm), axis=0, keepdims=True))
+            dr_nxm = np.exp(ldr_nxm - normalization_1xm) * len(seq_n)  # sum to n
+            # dr_nxm = dr_nxm * len(seq_n) / np.sum(dr_nxm, axis=0, keepdims=True)  # equivalent normalization
+        else:
+            dr_nxm = np.exp(ldr_nxm)
+        
+        designname2dr = {name: dr_nxm[:, idx - 1] for name, idx in self.designname2idx.items()} 
+        return designname2dr
+
+
+def select_intermediate_iterations(
+    name2designdata,
+    design_name_prefix,
+    threshold,
+    n_iter: int = 20,
+    verbose: bool = True,
+):
+    # check have designs for all candidate iterations
+    all_names = []
+    for i in range(n_iter):
+        name = '{}t{}'.format(design_name_prefix, i)
+        all_names.append(name)
+        if name not in name2designdata:
+            print(f'No design data for {name}, exiting.')
             return None
+    
+    # find interval between iterations where the mean difference in consecutive mean predictions
+    # surpasses threshold
+    threshold_satisfied = False
+    for interval in range(1, int(n_iter / 2) + 1):
+        
+        # extract iterations an interval apart
+        iters = list(range(interval - 1, n_iter, interval)) + [n_iter - 1]
+        iters = list(set(iters))
+        iters.sort()
+        
+        # compute difference in consecutive mean predictions
+        mean_preds = []
+        names = []
+        for i in iters:
+            name = '{}t{}'.format(design_name_prefix, i)
+            names.append(name)
+            _, _, preddesign_n = name2designdata[name]
+            mean_preds.append(np.mean(preddesign_n))
 
-        num_negative = self._neg_samples.size(0)
-        num_positive = len(self._pos_samples)
+        mean_consecutive_diff = np.mean(np.ediff1d(mean_preds))
+        if verbose:
+            print('Iterations {} (interval {}) have mean consecutive diff in mean prediction of {:.3f}.'.format(
+                iters, interval, mean_consecutive_diff
+            ))
+        
+        # check if surpasses threshold
+        if mean_consecutive_diff > threshold:
+            threshold_satisfied = True
+            break
+    
+    # if no interval surpasses threshold, just return the final design distributions
+    if not threshold_satisfied:
+        names = ['{}t{}'.format(design_name_prefix, n_iter - 1)]
+        _, _, preddesign_n = name2designdata[names[0]]
+        if verbose:
+            print('Returning iteration {} with mean prediction {:.3f}.'.format(
+                n_iter - 1, np.mean(preddesign_n)
+            ))
+        iters = [n_iter - 1]
+    
+    # names to remove
+    for name in names:
+        all_names.remove(name)
+    
+    return iters, all_names
 
-        if num_positive < num_negative:
-            return None
 
-        self.classifier.requires_grad_(True)
-        loss_fn = torch.nn.BCEWithLogitsLoss()
+def is_intermediate_iteration_name(design_name: str, n_iter: int = 20):
+    tok = design_name.split('-')  
+    if 't' in tok[-1]:
+        tok2 = tok[-1].split('t')
+        if int(tok2[-1]) < n_iter - 1: # e.g. cbas-ridge-0.1t0
+            return True
+        
 
-        neg_minibatch = self._neg_samples.to(device=self.device, dtype=self.dtype)
-        pos_minibatch = torch.stack([
-            self._pos_samples[idx] for idx in np.random.permutation(num_positive)[:num_negative]
-        ]).to(device=self.device, dtype=self.dtype)
-        minibatch_X = torch.cat([neg_minibatch, pos_minibatch])
-        minibatch_Z = torch.cat(
-            [torch.zeros(num_negative, 1), torch.ones(num_negative, 1)]
-        ).to(device=self.device, dtype=self.dtype)
+def prepare_name2designdata(
+        design_pkl_fname,
+        train_fname,
+        intermediate_iter_threshold: float = 0.1,
+        verbose: bool = True,
+    ):
 
-        self.optim.zero_grad()
-        loss = loss_fn(self.classifier(minibatch_X), minibatch_Z)
-        loss.backward()
-        self.optim.step()
-        self.update_target_network()
+    # load labeled designs from all design algorithms
+    with open(design_pkl_fname, 'rb') as f:
+        name2designdata = pickle.load(f)
+    for name, data in name2designdata.items():  # make sure all sequences are labeled 
+        if data[1] is None and not is_intermediate_iteration_name(name):
+            raise ValueError(f'No labels for {name}')
 
-        self.classifier.eval()
-        self.classifier.requires_grad_(False)
+    # load labeled training sequences
+    d = np.load(train_fname)
+    trainseqs_n = list(d['trainseq_n'])
+    ytrain_n = d['ytrain_n']
+    if verbose:
+        print(f'Loaded {ytrain_n.size} training points from {train_fname}.\n')
+    name2designdata['train'] = (trainseqs_n, ytrain_n, None)
+
+    # remove DbAS q > 0.6
+    for threshold in np.arange(0.7, 0.91, 0.1):
+        for it in range(20):
+            name = 'dbas-ridge-{:.1f}t{}'.format(threshold, it)
+            del name2designdata[name]
+            if verbose:
+                print(f'Removed {name} designs.')
+    
+    # remove Biswas
+    for temperature in [0.05]:
+        temp = round(temperature, 4)
+        for model_name in ['ridge', 'ff', 'cnn']:
+            name = f'biswas-{model_name}-{temp}'
+            del name2designdata[name]
+            if verbose:
+                print(f'Removed {name} designs.')
+
+    # select intermediate C/DbAS iterations to facilitate DRE for C/DbAS design distributions
+    for threshold in np.arange(0.1, 1, 0.1):
+        for weight_type in ['c', 'd']:
+            prefix =  '{}bas-ridge-{:.1f}'.format(weight_type, threshold)
+            out = select_intermediate_iterations(
+                name2designdata,
+                prefix,
+                intermediate_iter_threshold,
+                verbose=verbose
+            )
+            if out is not None:
+                iters, names_to_remove = out
+                if verbose:
+                    print(f'Using the following iterations for {prefix}: {iters}.')
+                    
+                for name in names_to_remove:
+                    del name2designdata[name] 
+                    if verbose:
+                        print(f'  Removed {name}')
+                    
+    if verbose:
+        print('Design names:')
+        for name in name2designdata:
+            print(name)
+    return name2designdata
+
+
+
+    
+
+
+
+    

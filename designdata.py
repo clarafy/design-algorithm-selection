@@ -256,7 +256,7 @@ def generate_rna_data(model_class,
 
     for landscape_name in landscape_names:
 
-        flexsshift = FLEXSShift(landscape_name, noise_sd=noise_sd)
+        flexsshift = DesignDataFactory(landscape_name, noise_sd=noise_sd)
         if landscape_name.lower() == 'gfp':
                 seed_idxs = [0]
         else:

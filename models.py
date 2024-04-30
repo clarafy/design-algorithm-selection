@@ -247,7 +247,7 @@ class TorchRegressorEnsemble(torch.nn.Module):
             y_nx2 = np.hstack([y_nx2, 0.5 * np.ones([len(seq_n), 1])])
 
         ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=True)
-        dataset = [(ohe_lxa, y_mean_var[0], y_mean_var[1]) for ohe_lxa, y_mean_var in zip(ohe_nxlxa, y_nx2)]
+        dataset = [(ohe_lxa, y_mean_var[0], np.fmin(y_mean_var[1], 1e6)) for ohe_lxa, y_mean_var in zip(ohe_nxlxa, y_nx2)]
 
         # split into training and validation
         shuffle_idx = np.random.permutation(len(dataset))
@@ -410,7 +410,10 @@ class SklearnRegressor():
         self.mse = None
         self.model_fitted = False
 
-    def fit(self, seq_n, y_n, val_frac: float = 0.1, verbose: bool = False):
+    def fit(self, seq_n, y_n, weight_n: np.array = None, val_frac: float = 0.1, verbose: bool = False):
+        if weight_n is None:
+            weight_n = np.ones([y_n.size])
+            
         ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
         ohe_nxla = np.reshape(ohe_nxlxa, [len(seq_n), ohe_nxlxa.shape[1] * ohe_nxlxa.shape[2]])
 
@@ -419,9 +422,9 @@ class SklearnRegressor():
         n_train = len(seq_n) - n_val
         train_idx, val_idx = shuffle_idx[: n_train], shuffle_idx[n_train :]
 
-        self.model.fit(ohe_nxla[train_idx], y_n[train_idx])
+        self.model.fit(ohe_nxla[train_idx], y_n[train_idx], sample_weight=weight_n[train_idx])
         predval_n = self.model.predict(ohe_nxla[val_idx])
-        self.mse = np.mean(np.square(y_n[val_idx] - predval_n))
+        self.mse = np.mean(weight_n[val_idx] * np.square(y_n[val_idx] - predval_n))
         self.model_fitted = True
 
     def predict(self, seq_n, verbose: bool = False):

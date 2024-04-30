@@ -328,7 +328,6 @@ def run_temperature_selection_experiments(
     exceedance_threshold: float = None,
     n_cal: int = 5000,
     n_design: int = 1000000,
-    alpha: float = 0.1,
     n_trial: int = 1000,
     n_train_lr: int = 500,
     self_normalize_weights: bool = True,
@@ -340,8 +339,8 @@ def run_temperature_selection_experiments(
 ):
     
     temperatures = list(temp2theta.keys())
-    imp_selected_column_names = ['tr{}_imp_selected_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
-    pp_selected_column_names = ['tr{}_pp_selected_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
+    imp_selected_column_names = ['imp_pval_temp{:.4f}'.format(temp) for temp in temperatures]
+    pp_selected_column_names = ['tr{}_pp_pval_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
     df = DataFrame(
         index=target_values, columns=imp_selected_column_names + pp_selected_column_names
     )
@@ -363,7 +362,7 @@ def run_temperature_selection_experiments(
         print('Selection quantity is the mean label.')
         predictor = model
         # seq2y = SEQ2YVAR
-    print('Range of provided target values: [{:.4f}, {:.4f}].\n'.format(np.min(target_values), np.max(target_values)))
+    print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(np.min(target_values), np.max(target_values)))
 
     
     t0 = time() 
@@ -435,14 +434,16 @@ def run_temperature_selection_experiments(
 
             for target_val in target_values:
 
-                # run imputation hypothesis test
-                imp_pval = _zstat_generic(
-                    imputed_mean,
-                    0,
-                    imputed_se,
-                    alternative='larger',
-                    diff=target_val
-                )[1]
+                if i == 0:  # only need to run one trial since N so large
+                    # run imputation hypothesis test
+                    imp_pval = _zstat_generic(
+                        imputed_mean,
+                        0,
+                        imputed_se,
+                        alternative='larger',
+                        diff=target_val
+                    )[1]
+                    df.loc[target_val]['imp_pval_temp{:.4f}'.format(i, temp)] = imp_pval
 
                 # run prediction-powered hypothesis test
                 pp_pval = rectified_p_value(
@@ -453,17 +454,7 @@ def run_temperature_selection_experiments(
                     null=target_val,
                     alternative='larger'
                 )
-
-                # Bonferroni correction
-                if imp_pval < alpha / target_values.size:
-                    df.loc[target_val]['tr{}_imp_selected_temp{:.4f}'.format(i, temp)] = 1
-                else:
-                    df.loc[target_val]['tr{}_imp_selected_temp{:.4f}'.format(i, temp)] = 0
-
-                if pp_pval < alpha / target_values.size:
-                    df.loc[target_val]['tr{}_pp_selected_temp{:.4f}'.format(i, temp)] = 1
-                else:
-                    df.loc[target_val]['tr{}_pp_selected_temp{:.4f}'.format(i, temp)] = 0
+                df.loc[target_val]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
                     
         print('Done running {} / {} trials for temperature {:.4f} ({} / {}) ({} s).'.format(
             n_trial, n_trial, temp, t + 1, len(temperatures), int(time() - t0)

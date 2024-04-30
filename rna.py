@@ -1,9 +1,11 @@
 import os
 import pickle
-
 from time import time
+
 import numpy as np
 import scipy as sc
+from pandas import DataFrame, read_csv
+from statsmodels.stats.weightstats import _zstat_generic
 
 try:
     import RNA
@@ -12,10 +14,13 @@ except ImportError:
 
 import models
 import designers
+from dre import MultiMDRE, prepare_name2designdata, is_intermediate_iteration_name
+from utils import RNA_NUCLEOTIDES, RNANUC2COMPLEMENT, get_mutant
+from calibrate import rectified_p_value
 
-from utils import RNA_NUCLEOTIDES, get_mutant
 
 # ===== ViennaRNA binding landscape =====
+
 
 class RNABinding():
     """
@@ -40,18 +45,20 @@ class RNABinding():
         "AGGGAAGAUUAGAUUACUCUUAUAUGACGUAGGAGAGAGUGCGGUUAAGA",
     ]
 
-    SEQ_LEN = 50
-
     def __init__(
         self,
-        binding_target_idx: int = 0,
+        seq_len: int = 50,
+        binding_target_idx = 0,
+        noise_sd: float = 0.02,
     ):
         """
         Create an RNABinding landscape.
 
         Args:
-            binding_target_idx:
-
+            seq_len: length of sequence domain of this landscape (not necessarily equal to length of binding target).
+            binding_target_idx: index or list of indices into the list of possible binding targets, BINDING_TARGETS.
+            noise_sd: standard deviation of measurement noise that will be added when returning binding energy
+                of a sequence.
         """
         # ViennaRNA is not available through pip, so give a warning message
         # if not installed.
@@ -67,54 +74,77 @@ class RNABinding():
                 "https://anaconda.org/bioconda/viennarna."
             ) from e
         
-        self.target = self.BINDING_TARGETS[binding_target_idx]
-        self.norm_value = self.compute_min_binding_energy()
+        if isinstance(binding_target_idx, int):
+            binding_target_idx = [binding_target_idx]
+        self.targets = [self.BINDING_TARGETS[i] for i in binding_target_idx]
 
-    def compute_min_binding_energy(self):
-        """Compute the lowest possible binding energy for the target."""
-        complements = {"A": "U", "C": "G", "G": "C", "U": "A"}
+        self.seq_len = seq_len
+        self.norm_values = self.compute_min_binding_energies()
+        self.noise_sd = noise_sd
 
-        complement = "".join(complements[x] for x in self.target)[::-1]
-        energy = RNA.duplexfold(complement, self.target).energy
-        return energy * self.SEQ_LEN / len(self.target)
+    def compute_min_binding_energies(self):
+        """Compute the lowest possible binding energies for the target sequences."""
+        
+        energy_t = []
+        for target in self.targets:
+            complement = "".join(RNANUC2COMPLEMENT[nuc] for nuc in target)[::-1]
+            energy = RNA.duplexfold(complement, target).energy
+            energy_t.append(energy * self.seq_len / len(target))
 
-    def get_fitness(self, sequences):
-        fitnesses = []
+        return np.array(energy_t)
+
+    def get_fitness(self, sequences, geometric_mean: bool = True):
+        fitness_n = []
 
         for seq in sequences:
 
-            if len(seq) != self.SEQ_LEN:
-                raise ValueError('All sequences in `sequences` must be of length {self.SEQ_LEN}.')
+            if len(seq) != self.seq_len:
+                raise ValueError('All sequences in `sequences` must be of length {self.seq_len}.')
+            
+            energy_t = np.array([RNA.duplexfold(target, seq).energy for target in self.targets])
 
-            energy = RNA.duplexfold(self.target, seq).energy
-            fitnesses.append(energy / self.norm_value)
+            if geometric_mean:
+                fitness = sc.stats.mstats.gmean(energy_t / self.norm_values)
+            else:
+                fitness = np.mean(energy_t / self.norm_values)
 
-        return np.array(fitnesses)
+            fitness_n.append(fitness)
+
+        # add homoskedastic measurement noise
+        fitness_n = np.array(fitness_n)
+        if self.noise_sd:
+            fitness_n = sc.stats.norm.rvs(loc=fitness_n, scale=self.noise_sd)
+            fitness_n = np.fmin(np.fmax(fitness_n, 0), 1)
+
+        return fitness_n
     
     def get_training_data(
             self,
             n_train: int,
-            p_mut: float,
+            p_mut: float = 0.08,
             seed_idx: int = 3,
-            noise_sd: float = 0.02
         ):
         """
         Generates labeled training sequences, each of which is a mutant of a seed with
         probability p_mut of a mutation at each nucleotide site.
         """
+
         trainseqs_n = [get_mutant(self.SEEDS[seed_idx], p_mut, RNA_NUCLEOTIDES) for _ in range(n_train)]
         print('Generating {} labeled sequences...'.format(n_train))
         t0 = time()
         ytrain_n = self.get_fitness(trainseqs_n)
         print('Done. ({} s)'.format(int(time() - t0)))
-        noise_n = sc.stats.norm.rvs(loc=0, scale=noise_sd, size=n_train)
-        ytrain_n = ytrain_n + noise_n
         return trainseqs_n, ytrain_n
+
+
+# ===== functions for training models and designing sequences =====s
 
 
 def train_models(
         n_train: int,
-        p_mutation: float = 0.1,
+        binding_target_idx = 0,
+        seed_idx = 3,
+        p_mutation: float = 0.08,
         noise_sd: float = 0.02,
         n_hidden: int = 10,
         n_epoch: int = 5,
@@ -124,29 +154,28 @@ def train_models(
         save_fname_no_ftype: str = None,
     ):
     """
-    Trains a ridge regression model, ensemble of CNNs, and ensemble of feedforward models
-    given training data.
+    Generates training data and trains ridge regression, ensemble of CNNs, and ensemble of feedforward models.
     """
 
     # generate training and test data
-    landscape = RNABinding()
+    landscape = RNABinding(seq_len=50, binding_target_idx=binding_target_idx, noise_sd=noise_sd)
     trainseq_n, ytrain_n = landscape.get_training_data(
         n_train,
         p_mutation,
-        noise_sd=noise_sd
+        seed_idx=seed_idx,
     )
     testseq_n, ytest_n = landscape.get_training_data(
         n_train,
         p_mutation,
-        noise_sd=noise_sd
+        seed_idx=seed_idx,
     )
 
     # train models
-    ridge = models.RidgeRegressor(seq_len=landscape.SEQ_LEN, alphabet=RNA_NUCLEOTIDES)
+    ridge = models.RidgeRegressor(seq_len=landscape.seq_len, alphabet=RNA_NUCLEOTIDES)
     ridge.fit(trainseq_n, ytrain_n)
     print(f'CV-selected alpha for ridge: {ridge.model.alpha_}.')
 
-    ff = models.FeedForward(landscape.SEQ_LEN, RNA_NUCLEOTIDES, n_hidden)
+    ff = models.FeedForward(landscape.seq_len, RNA_NUCLEOTIDES, n_hidden)
     _ = ff.fit(
         trainseq_n,
         ytrain_n,
@@ -154,7 +183,7 @@ def train_models(
         lr=lr,
     )
 
-    cnn = models.CNN(landscape.SEQ_LEN, RNA_NUCLEOTIDES, n_filters, n_hidden)
+    cnn = models.CNN(landscape.seq_len, RNA_NUCLEOTIDES, n_filters, n_hidden)
     _ = cnn.fit(
         trainseq_n,
         ytrain_n,
@@ -178,32 +207,75 @@ def train_models(
     else:
         print('`save_fname_no_ftype` not provided, not saving models or data.')
     
-    return ridge, ff, cnn, testseq_n, ytest_n
+    return ridge, ff, cnn, trainseq_n, ytrain_n, testseq_n, ytest_n
 
 
-def write_sequences(seq_n, fname):
-    with open(fname, 'w') as f:
-        for seq in seq_n:
-            f.write(f"{seq}\n")
+def label_design_sequences(
+    design_pkl_fname: str,
+    binding_target_idx: int = 0,
+    seed_idx: int = 3,
+    noise_sd: float = 0.02
+):  
+    landscape = RNABinding(binding_target_idx=[binding_target_idx], noise_sd=noise_sd)
+    print('Using landscape with binding target {}, seed sequence {}, and noise SD {:.2f}.'.format(
+        binding_target_idx, seed_idx, noise_sd
+    ))
+
+    print('Loading/saving name2designdata to {}'.format(design_pkl_fname))
+    with open(design_pkl_fname, 'rb') as f:
+        name2designdata = pickle.load(f)
+
+    t0 = time()
+    for name, data in name2designdata.items():
+        if name == 'train':
+            continue
+
+        # no need to label sequences from intermediate C/DbAS iterations,
+        # only used to facilitate density ratio estimation
+        if is_intermediate_iteration_name(name):
+            print(f'Skipping labels for {name}.')
+            continue
+
+        designseq_n, ydesign_n, preddesign_n = data
+
+        if ydesign_n is None:
+            print(f'Getting labels for {name}...')
+            ydesign_n = landscape.get_fitness(designseq_n)
+            print('  Mean prediction: {:.3f}, mean label: {:.3f}. ({} s)\n'.format(
+                np.mean(preddesign_n), np.mean(ydesign_n), int(time() - t0)
+            ))
+            # save labels
+            name2designdata[name] = (designseq_n, ydesign_n, preddesign_n)
+            with open(design_pkl_fname, 'wb') as f:
+                pickle.dump(name2designdata, f)
+
+        # already labeled
+        else:
+            print('{} already labeled. Mean prediction: {:.3f}, mean label: {:.3f}\n.'.format(
+                name, np.mean(preddesign_n), np.mean(ydesign_n)
+            ))
 
 
-def sample_design_sequences(
+def sample_design_sequences(  # TODO: config/hydra
     n_design: int,
     adalead_thresholds,
     biswas_temperatures,
+    cbas_dbas_quantiles,
     model_and_data_fname_no_ftype: str,
     model_and_data_path: str = '/homefs/home/wongfanc/density-ratio-estimation/rna-models',
+    seed_idx: int = 3,
     design_pkl_fname: str = None,
+    intermediate_iter = None,
     n_hidden: int = 100,
     n_filters: int = 32,
     n_recomb_partner: int = 1,
     recomb_rate: float = 0.2,
+    max_model_queries: int = None,
     max_mu: float = 2,
-    n_trust_radius_mutations: int = 10,
-    n_step: int = 10000,
+    n_trust_radius_mutations: int = 5,
+    n_step: int = 2000,
     latent_dim: int = 10,
     n_vae_hidden: int = 20,
-    quantile: float = 0.95,
     p_mutation_pex: float = 0.04,
 ):
     """
@@ -218,15 +290,15 @@ def sample_design_sequences(
     print(f'Loaded {ytrain_n.size} training points from {data_fname}.\n')
 
     # train ridge regression, load trained FF and CNN models
-    ridge = ridge = models.RidgeRegressor(seq_len=RNABinding.SEQ_LEN, alphabet=RNA_NUCLEOTIDES)
+    ridge = ridge = models.RidgeRegressor(seq_len=50, alphabet=RNA_NUCLEOTIDES)
     ridge.fit(trainseq_n, ytrain_n)
 
     ff_fname = os.path.join(model_and_data_path, 'ff-' + model_and_data_fname_no_ftype + '.pt')
-    ff = models.FeedForward(RNABinding.SEQ_LEN, RNA_NUCLEOTIDES, n_hidden)
+    ff = models.FeedForward(50, RNA_NUCLEOTIDES, n_hidden)
     ff.load(ff_fname)
 
     cnn_fname = os.path.join(model_and_data_path, 'cnn-' + model_and_data_fname_no_ftype + '.pt')
-    cnn = models.CNN(RNABinding.SEQ_LEN, RNA_NUCLEOTIDES, n_filters, n_hidden)
+    cnn = models.CNN(50, RNA_NUCLEOTIDES, n_filters, n_hidden)
     cnn.load(cnn_fname)
 
     name2model = {
@@ -237,9 +309,86 @@ def sample_design_sequences(
 
     # design sequences
     name2designs = {}
-    landscape = RNABinding()
     if design_pkl_fname is not None:
         print(f'Saving all results to {design_pkl_fname}.\n')
+    else:
+        print('`design_pkl_fname` not provided, not saving design results.\n')
+
+    # ===== CbAS ridge with intermediate iterations =====
+    if intermediate_iter is None:
+        intermediate_iter = range(20)
+    
+    cbas = designers.CbAS(
+        ridge,
+        trainseq_n,
+        latent_dim=latent_dim,
+        n_hidden=n_vae_hidden,
+        weight_type='cbas',
+        device='cuda'
+    )
+    for quantile in cbas_dbas_quantiles:
+        quantile = round(quantile, 2)
+
+        # design sequences
+        print(f'Designing CbAS {quantile} ridge sequences from intermediate iterations...')
+        t0 = time()
+        cbas_iter2designseq = cbas.design_sequences_from_intermediate_iterations(
+            n_design,
+            intermediate_iter,
+            quantile=quantile
+        )
+        print(f'  Done. ({int(time() - t0)} s)')
+        
+        # store
+        for it, cbas_n in cbas_iter2designseq.items():
+            predcbas_n = ridge.predict(cbas_n)
+            print('  Mean prediction for iteration {}: {:.3f}'.format(it, np.mean(predcbas_n)))
+            name2designs[f'cbas-ridge-{quantile}t{it}'] = (cbas_n, None, predcbas_n)
+            # save
+            if design_pkl_fname is not None:
+                with open(design_pkl_fname, 'wb') as f:
+                    pickle.dump(name2designs, f)
+                print(f'  Saved {n_design} CbAS {quantile} t = {it} ridge sequences.')
+            print()
+
+    # ===== DbAS ridge with intermediate iterations =====
+    dbas = designers.CbAS(
+        ridge,
+        trainseq_n,
+        latent_dim=latent_dim,
+        n_hidden=n_vae_hidden,
+        weight_type='dbas',
+        device='cuda'
+    )
+    for quantile in cbas_dbas_quantiles:
+        quantile = round(quantile, 2)
+
+        # design sequences
+        print(f'Designing DbAS {quantile} ridge sequences...')
+        t0 = time()
+        dbas_iter2designseq = dbas.design_sequences_from_intermediate_iterations(
+            n_design,
+            intermediate_iter,
+            quantile=quantile
+        )
+        print(f'  Done. ({int(time() - t0)} s)')
+
+        # store
+        for it, dbas_n in dbas_iter2designseq.items():
+            preddbas_n = ridge.predict(dbas_n)
+            print('  Mean prediction for iteration {}: {:.3f}'.format(it, np.mean(preddbas_n)))
+            name2designs[f'dbas-ridge-{quantile}t{it}'] = (dbas_n, None, preddbas_n)
+            # save
+            if design_pkl_fname is not None:
+                with open(design_pkl_fname, 'wb') as f:
+                    pickle.dump(name2designs, f)
+                print(f'  Saved {n_design} DbAS {quantile} t = {it} ridge sequences.')
+            print()
+    
+
+    # all other design algorithms
+    if max_model_queries is None:
+        max_model_queries = 5 * n_design
     for model_name, model in name2model.items():
 
         # ===== AdaLead =====
@@ -256,17 +405,15 @@ def sample_design_sequences(
                 threshold=threshold,
                 n_recomb_partner=n_recomb_partner,
                 recomb_rate=recomb_rate,
-                print_every=20000
+                max_model_queries=max_model_queries
             )
             print(f'  Done. ({int(time() - t0)} s)')
             
             # store
             predadalead_n = model.predict(adalead_n)
-            yadalead_n = landscape.get_fitness(adalead_n)
-            print('  Mean label, prediction: {:.3f}, {:.3f}'.format(
-                np.mean(yadalead_n), np.mean(predadalead_n)
-            ))
-            name2designs[f'adalead{threshold}-{model_name}'] = (adalead_n, yadalead_n, predadalead_n)
+            # yadalead_n = landscape.get_fitness(adalead_n)
+            print('  Mean prediction: {:.3f}'.format(np.mean(predadalead_n)))
+            name2designs[f'adalead-{model_name}-{threshold}'] = (adalead_n, None, predadalead_n)
             
             # save
             if design_pkl_fname is not None:
@@ -286,22 +433,20 @@ def sample_design_sequences(
             t0 = time()
             biswas_n, _, _ = biswas.design_sequences(
                 n_design,
-                RNABinding.SEEDS[3],
+                RNABinding.SEEDS[seed_idx],
                 max_mu,
                 temp,
                 n_trust_radius_mutations,
                 n_step,
-                print_every=2000
+                print_every=500
             )
             print(f'  Done. ({int(time() - t0)} s)')
 
             # store
             predbiswas_n = model.predict(biswas_n)
-            ybiswas_n = landscape.get_fitness(biswas_n)
-            print('  Mean label, prediction: {:.3f}, {:.3f}'.format(
-                np.mean(ybiswas_n), np.mean(predbiswas_n)
-            ))
-            name2designs[f'biswas{temp}-{model_name}'] = (biswas_n, ybiswas_n, predbiswas_n)
+            # ybiswas_n = landscape.get_fitness(biswas_n)
+            print('  Mean prediction: {:.3f}'.format(np.mean(predbiswas_n)))
+            name2designs[f'biswas-{model_name}-{temp}'] = (biswas_n, None, predbiswas_n)
 
             # save
             if design_pkl_fname is not None:
@@ -310,68 +455,38 @@ def sample_design_sequences(
                 print(f'  Saved {n_design} Biswas temperature = {temp} {model_name} sequences.')
             print()
 
-        # ===== CbAS =====
-        cbas = designers.CbAS(
-            model,
-            trainseq_n,
-            latent_dim=latent_dim,
-            n_hidden=n_vae_hidden,
-            weight_type='cbas',
-            device='cpu'
-        )
-        # design sequences
-        print(f'Designing CbAS {model_name} sequences...')
-        t0 = time()
-        cbas_n = cbas.design_sequences(
-            n_design,
-            quantile=quantile
-        )
-        print(f'  Done. ({int(time() - t0)} s)')
-        # store
-        predcbas_n = model.predict(cbas_n)
-        ycbas_n = landscape.get_fitness(cbas_n)
-        print('  Mean label, prediction: {:.3f}, {:.3f}'.format(
-            np.mean(ycbas_n), np.mean(predcbas_n)
-        ))
-        name2designs[f'cbas-{model_name}'] = (cbas_n, ycbas_n, predcbas_n)
-        # save
-        if design_pkl_fname is not None:
-            with open(design_pkl_fname, 'wb') as f:
-                pickle.dump(name2designs, f)
-            print(f'  Saved {n_design} CbAS {model_name} sequences.')
-        print()
+        if model_name != 'ridge':
 
+            # ===== DbAS =====
+            dbas = designers.CbAS(
+                model,
+                trainseq_n,
+                latent_dim=latent_dim,
+                n_hidden=n_vae_hidden,
+                weight_type='dbas',
+                device='cuda'
+            )
+            for quantile in cbas_dbas_quantiles:
+                quantile = round(quantile, 2)
 
-        # ===== DbAS =====
-        dbas = designers.CbAS(
-            model,
-            trainseq_n,
-            latent_dim=latent_dim,
-            n_hidden=n_vae_hidden,
-            weight_type='dbas',
-            device='cpu'
-        )
-        # design sequences
-        print(f'Designing DbAS {model_name} sequences...')
-        t0 = time()
-        dbas_n = dbas.design_sequences(
-            n_design,
-            quantile=quantile
-        )
-        print(f'  Done. ({int(time() - t0)} s)')
-        # store
-        preddbas_n = model.predict(dbas_n)
-        ydbas_n = landscape.get_fitness(dbas_n)
-        print('  Mean label, prediction: {:.3f}, {:.3f}'.format(
-            np.mean(ydbas_n), np.mean(preddbas_n)
-        ))
-        name2designs[f'dbas-{model_name}'] = (dbas_n, ydbas_n, preddbas_n)
-        # save
-        if design_pkl_fname is not None:
-            with open(design_pkl_fname, 'wb') as f:
-                pickle.dump(name2designs, f)
-            print(f'  Saved {n_design} DbAS {model_name} sequences.')
-        print()
+                # design sequences
+                print(f'Designing DbAS {quantile} {model_name} sequences...')
+                t0 = time()
+                dbas_n = dbas.design_sequences(
+                    n_design,
+                    quantile=quantile
+                )
+                print(f'  Done. ({int(time() - t0)} s)')
+                # store
+                preddbas_n = model.predict(dbas_n)
+                print('  Mean prediction: {:.3f}'.format(np.mean(preddbas_n)))
+                name2designs[f'dbas-{model_name}-{quantile}'] = (dbas_n, None, preddbas_n)
+                # save
+                if design_pkl_fname is not None:
+                    with open(design_pkl_fname, 'wb') as f:
+                        pickle.dump(name2designs, f)
+                    print(f'  Saved {n_design} DbAS {quantile} {model_name} sequences.')
+                print()
 
 
         # ===== PEX =====
@@ -379,7 +494,7 @@ def sample_design_sequences(
             model,
             trainseq_n,
             ytrain_n,
-            RNABinding.SEEDS[3],
+            RNABinding.SEEDS[seed_idx],
         )
         # design sequences
         print(f'Designing PEX {model_name} sequences...')
@@ -391,11 +506,9 @@ def sample_design_sequences(
         print(f'  Done. ({int(time() - t0)} s)')
         # store
         predpex_n = model.predict(pex_n)
-        ypex_n = landscape.get_fitness(pex_n)
-        print('  Mean label, prediction: {:.3f}, {:.3f}'.format(
-            np.mean(ypex_n), np.mean(predpex_n)
-        ))
-        name2designs[f'pex-{model_name}'] = (pex_n, ypex_n, predpex_n)
+        # ypex_n = landscape.get_fitness(pex_n)
+        print('  Mean prediction: {:.3f}'.format(np.mean(predpex_n)))
+        name2designs[f'pex-{model_name}'] = (pex_n, None, predpex_n)
         # save
         if design_pkl_fname is not None:
             with open(design_pkl_fname, 'wb') as f:
@@ -405,5 +518,161 @@ def sample_design_sequences(
     return name2designs
 
 
-     
+def run_selection_experiments(
+    design_names,
+    design_pkl_fname: str,
+    model_and_data_fname_no_ftype: str,
+    calibration_pkl_fname: str,
+    mdre_group_regex_strs,
+    target_values: np.array,
+    n_trial: int,
+    intermediate_iter_threshold: float = 0.1,
+    n_hidden: int = 100,
+    n_filters: int = 32,
+    n_mdre_hidden: int = 500,
+    n_mdre_epoch: int = 100,
+    n_cal: int = 5000,
+    results_csv_fname: str = None,
+    model_and_data_path: str = '/homefs/home/wongfanc/density-ratio-estimation/rna-models',
+    device = None,
+):
+    # load design sequences
+    # and prepare intermediate iterations for C/DbAS
+    train_fname = os.path.join(model_and_data_path, 'traindata-' + model_and_data_fname_no_ftype + '.npz')
+    name2designdata = prepare_name2designdata(
+        design_pkl_fname,
+        train_fname,
+        intermediate_iter_threshold=intermediate_iter_threshold,
+        verbose=False
+    )
+
+    assert('train' in name2designdata)
+    (trainseqs_n, ytrain_n, predtrain_n) = name2designdata['train']
+    assert(predtrain_n is None)
+
+    print('All design names in provided design data:')
+    for name in name2designdata:
+        print(name)
+    print()
+        
+    # name2designdata may contain other distributions used to faciliate DRE,
+    # but which we are not interested in designs from
+    for name in design_names:
+        assert(name in name2designdata)
+
+    # ----- load models -----
+    # load training data and fit ridge regression
+    d = np.load(train_fname)
+    trainseqs_n = list(d['trainseq_n'])
+    ytrain_n = d['ytrain_n']
+    ridge = ridge = models.RidgeRegressor(seq_len=50, alphabet=RNA_NUCLEOTIDES)
+    ridge.fit(trainseqs_n, ytrain_n)
+
+    # load trained FF and CNN models
+    ff_fname = os.path.join(model_and_data_path, 'ff-' + model_and_data_fname_no_ftype + '.pt')
+    ff = models.FeedForward(50, RNA_NUCLEOTIDES, n_hidden)
+    ff.load(ff_fname)
+    cnn_fname = os.path.join(model_and_data_path, 'cnn-' + model_and_data_fname_no_ftype + '.pt')
+    cnn = models.CNN(50, RNA_NUCLEOTIDES, n_filters, n_hidden)
+    cnn.load(cnn_fname)
+    name2model = {
+        'ridge': ridge,
+        'ff': ff,
+        'cnn': cnn
+    }
+
+    # dataframe to record selection experiment results
+    imp_selected_column_names = ['imp_pval_{}'.format(name) for name in design_names]
+    pp_selected_column_names = ['tr{}_pp_pval_{}'.format(i, name) for i in range(n_trial) for name in design_names]
+    target_values = [round(val, 4) for val in target_values]
+    df = DataFrame(
+        index=target_values, columns=imp_selected_column_names + pp_selected_column_names
+    )
+
+    mdre = MultiMDRE(
+        mdre_group_regex_strs,
+        device=device
+    )
+
+    # imputation selection experiments
+    # (single trial due to large number of design sequences)
+    for design_name in design_names:
+        (_, _, preddesign_n) = name2designdata[design_name]
+
+        imputed_mean = np.mean(preddesign_n)
+        imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
+
+        for target_val in target_values:
+
+            # get imputation p-value
+            imp_pval = _zstat_generic(
+                imputed_mean,
+                0,
+                imputed_se,
+                alternative='larger',
+                diff=target_val
+            )[1]
+
+            df.loc[target_val]['imp_pval_{}'.format(design_name)] = imp_pval
+
+    # load calibration data
+    with open(calibration_pkl_fname, 'rb') as f:
+        caldata_t = pickle.load(f)
+
+    t0 = time()
+    for t in range(n_trial):
+
+        # load labeled calibration sequences from training distribution
+        calseqs_n, ycal_n = caldata_t[t]
+        assert(len(calseqs_n) == n_cal)
+        name2designdata['train'] = (trainseqs_n + calseqs_n, np.hstack([ytrain_n, ycal_n]), None)
+
+        # get predictions for calibration sequences
+        name2predcal = {name: model.predict(calseqs_n) for name, model in name2model.items()}
+
+        # fit density ratio estimator (DRE) for all design algorithms
+        mdre.fit(name2designdata, n_hidden=n_mdre_hidden, n_epoch=n_mdre_epoch, verbose=(t == 0))
+
+        for design_name in design_names:
+            (_, _, preddesign_n) = name2designdata[design_name]
+
+            # ----- quantities for prediction-powered test -----
+            imputed_mean = np.mean(preddesign_n)
+            imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
+
+            # predictions for calibration sequences
+            for model_name in name2predcal.keys():
+                if model_name in design_name:
+                    predcal_n = name2predcal[model_name]
+                    break
+
+            # DRs for calibration sequences
+            caldr_n = mdre.get_dr(calseqs_n, design_name, self_normalize=True, verbose=False)
+
+            # rectifier sample mean and standard error
+            rect_n = caldr_n * (ycal_n - predcal_n)
+            rectifier_mean = np.mean(rect_n)
+            rectifier_se = np.std(rect_n) / np.sqrt(rect_n.size)
+            
+            for target_val in target_values:
+
+                # get prediction-powered p-value
+                pp_pval = rectified_p_value(
+                    rectifier_mean,
+                    rectifier_se,
+                    imputed_mean,
+                    imputed_se,
+                    null=target_val,
+                    alternative='larger'
+                )
+                
+                df.loc[target_val]['tr{}_pp_pval_{}'.format(t, design_name)] = pp_pval
+
+        print('Done running {} / {} trials ({} s).'.format(t + 1, n_trial, int(time() - t0)))
+        if results_csv_fname is not None:
+            df.to_csv(results_csv_fname, index_label='target_value')  # time sink
+            print('Saved to {} ({} s).\n'.format(results_csv_fname, int(time() - t0)))
+
+    return df
+
 

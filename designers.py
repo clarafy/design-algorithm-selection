@@ -51,7 +51,7 @@ class CbAS(Designer):
             n_hidden=n_hidden,
             device=device,
         )
-        print('Fitting training distribution:')
+        print('Fitting training distribution to initialize {}bAS:'.format(weight_type[0].upper()))
         self.train_vae.fit(trainseq_n, n_epoch=n_init_epoch, verbose=True)
 
         # design distribution
@@ -63,13 +63,14 @@ class CbAS(Designer):
             device=device,
         )
         self.design_distribution_fitted = False
+        self.iter2statedict = {}
         self.alphabet = alphabet
         self.fitted_quantile = None
         self.weight_type = weight_type
 
     def fit_design_distribution(
             self,
-            n_iter: int,
+            n_iter: int = 20,
             n_sample: int = 1000,
             quantile: float = 0.9,
             tol: float = 1e-6,
@@ -121,6 +122,9 @@ class CbAS(Designer):
                 t, np.mean(pred_n), np.std(pred_n), np.max(pred_n), keep_idx.size, threshold, int(time() - t0)
             ))
 
+            # save parameters of this intermediate design distribution
+            self.iter2statedict[t] = deepcopy(self.design_vae.state_dict())
+
         df = DataFrame(df_data, columns=['mean_pred', 'sd_pred', 'max_pred', 'n_valid_samples', 'threshold'])
         self.design_distribution_fitted = True
         self.fitted_quantile = quantile
@@ -131,11 +135,11 @@ class CbAS(Designer):
             n_design,
             n_iter: int = 20,
             n_sample: int = 1000,
-            quantile: float = 0.95,
-            n_epoch: int = 5
+            quantile: float = 0.9,
+            n_epoch: int = 5,
         ):
         if not self.design_distribution_fitted or self.fitted_quantile != quantile:
-            print('Fitting design distribution with quantile hyperparameter = {}:'.format(quantile))
+            print('Fitting design distribution with quantile hyperparameter = {:.3}:'.format(quantile))
             _ = self.fit_design_distribution(
                 n_iter=n_iter,
                 n_sample=n_sample,
@@ -143,8 +147,40 @@ class CbAS(Designer):
                 n_epoch=n_epoch
             )
             self.fitted_quantile = quantile
+        
         designseq_n, _, _ = self.design_vae.generate(n_design)
         return designseq_n
+    
+    def design_sequences_from_intermediate_iterations(
+            self,
+            n_design,
+            intermediate_iter,
+            n_iter: int = 20,
+            n_sample: int = 1000,
+            quantile: float = 0.9,
+            n_epoch: int = 5,
+        ):
+        if not self.design_distribution_fitted or self.fitted_quantile != quantile:
+            t0 = time()
+            print('Fitting design distribution with quantile hyperparameter = {:.3}:'.format(quantile))
+            _ = self.fit_design_distribution(
+                n_iter=n_iter,
+                n_sample=n_sample,
+                quantile=quantile,
+                n_epoch=n_epoch
+            )
+            print('  Done. ({} s)'.format(int(time() - t0)))
+            self.fitted_quantile = quantile
+        
+        iter2designseq = {}
+        for t in intermediate_iter:
+            self.design_vae.load_state_dict(self.iter2statedict[t])
+            t0 = time()
+            print('Designing sequences from quantile = {:.3f}, iteration {} / {}...'.format(quantile, t, n_iter - 1))
+            designseq_n, _, _ = self.design_vae.generate(n_design)
+            print('  Done. ({} s)'.format(int(time() - t0)))
+            iter2designseq[t] = designseq_n
+        return iter2designseq
 
 
 class PEX(Designer):
@@ -220,7 +256,7 @@ class PEX(Designer):
             candidate_dist2seqpred[dist].append([candidate_seq, pred])
 
         for dist in sorted(candidate_dist2seqpred.keys()):
-            candidate_dist2seqpred[dist].sort(reverse=True, key=lambda seqy:seqy[1])
+            candidate_dist2seqpred[dist].sort(reverse=True, key=lambda seqpred:seqpred[1])
         
         # iteratively extract the proximal frontier. 
         designs = []
@@ -298,78 +334,75 @@ class AdaLead(Designer):
     def design_sequences(
             self,
             n_design: int,
-            n_candidates: int = None,
+            max_model_queries: int = None,
             threshold: float = 0.05,
             n_recomb_partner: int = 0,
             recomb_rate: float = 0,
             mutation_rate: float = 1,
-            print_every: int = None
+            eval_batch_size: int = 1000
         ):
 
-        if n_candidates is None:
-            n_candidates = 2 * n_design
-        assert(n_candidates >= n_design)
+        if max_model_queries is None:
+            max_model_queries = 5 * n_design
+        assert(max_model_queries >= n_design)
 
         # extract all training sequences within percentile of the maximum fitness
         y_max = np.max(self.ytrain_n)
         top_idx = np.where(self.ytrain_n >= y_max * (1 - np.sign(y_max) * threshold))[0]
-
         parentseq_n = [self.trainseq_n[i] for i in top_idx]
 
-        design_n = []
-        t0 = time()
-        while len(design_n) < n_candidates:
+        design_n = {}
+        n_model_queries = 0
+        while n_model_queries < max_model_queries:
             
             # generate recombinant mutants as parents
-            if n_recomb_partner:
-                for _ in range(n_recomb_partner):
-                    nodeseq_n = recombine_population(parentseq_n, recomb_rate)
-            else:
-                nodeseq_n = parentseq_n.copy()
-            
-            # get predictions for parents
-            predparents_n = self.model.predict(nodeseq_n)
+            for _ in range(n_recomb_partner):
+                parentseq_n = recombine_population(parentseq_n, recomb_rate)
 
-            # pair each node sequence with the index of its parent,
-            # to be able to access parent predictions
-            nodes_n = list(enumerate(nodeseq_n))
+            # "rollout" procedure in AdaLead paper: generate mutants (children)
+            # for each parent (root of the rollout tree) until get a child
+            # with less optimistic prediction
+            for i in range(0, len(parentseq_n), eval_batch_size):
+                rootseq_n = parentseq_n[i : i + eval_batch_size]
+                predroot_n = self.model.predict(rootseq_n)
+                n_model_queries += len(rootseq_n)
 
-            while len(nodes_n) and len(design_n) < n_candidates:
+                # current nodes in the tree for which we are generating children.
+                # each node sequence is paired with the index of its root,
+                # so that we can reference the root's prediction.
+                nodes_n = list(enumerate(rootseq_n))
 
-                # generate random mutant child for each node,
-                # keeping track of the index of the upstream parent
-                child_n = [
-                    (parent_idx, get_mutant(seq, mutation_rate / len(seq), self.alphabet))
-                    for parent_idx, seq in nodes_n
-                ]
+                while len(nodes_n) and n_model_queries < max_model_queries:
+                    rootidx_n = []
+                    childseq_n = []
 
-                # get predictions for children
-                predchild_n = self.model.predict([seq for _, seq in child_n])
+                    # generate new/unseen mutant per node.
+                    # while-loop as opposed to for-loop ensures every node gets a new/unseen child
+                    while len(childseq_n) < len(nodes_n):
+                        root_idx, node_seq = nodes_n[len(childseq_n)]
+                        child_seq = get_mutant(node_seq, mutation_rate * 1 / len(node_seq), self.alphabet)
 
-                # select some children as designs and new nodes
-                nodes_n = []
-                for (parent_idx, child_seq), predchild in zip(child_n, predchild_n):
+                        if child_seq not in self.trainseq_n and child_seq not in design_n:
+                            # record index of child's root, so that we can reference the root's prediction
+                            rootidx_n.append(root_idx)
+                            childseq_n.append(child_seq)
 
-                    # select child sequences that have not been observed before as designs 
-                    if child_seq not in self.trainseq_n and child_seq not in design_n:
-                        design_n.append(child_seq)
+                    # add all children as candidate design sequences
+                    predchild_n = self.model.predict(childseq_n)
+                    n_model_queries += len(childseq_n)
+                    design_n.update(zip(childseq_n, predchild_n))
 
-                        if print_every is not None and len(design_n) % print_every == 0:
-                            print('Designed {} / {} candidates ({} s).'.format(
-                                len(design_n), n_candidates, int(time() - t0)
-                            ))
+                    # set each child as new node if its prediction is better than that of its root
+                    nodes_n = []
+                    for root_idx, child_seq, predchild in zip(rootidx_n, childseq_n, predchild_n):
+                        if predchild >= predroot_n[root_idx]:
+                            nodes_n.append((root_idx, child_seq))
 
-                        # if child also has better prediction than upstream parent,
-                        # add as new node
-                        if predchild >= predparents_n[parent_idx]:
-                            nodes_n.append([parent_idx, child_seq])
-        
-        preddesign_n = self.model.predict(design_n)
-        idx = np.argsort(preddesign_n)[::-1][: n_design]
-        design_n = [design_n[i] for i in idx]
-
-        return design_n
-
+        # return designs with best predictions
+        designseq_n, preddesign_n = list(zip(*list(design_n.items())))
+        idx = np.argsort(preddesign_n)[-n_design :]
+        designseq_n = [designseq_n[i] for i in idx]
+        return designseq_n
 
 def add_mutations(seq, n_mutation: int, alphabet: str = RNA_NUCLEOTIDES):
 
@@ -405,9 +438,9 @@ class Biswas(Designer):
             print_every: int
         ):
 
-        # initialize sampling chains with random mutants of seed,d
+        # initialize sampling chains with random mutants of seed,
         # following same initialization procedure as Biswas et al. (2021)
-        n_mutation_n = np.random.poisson(2, size=n_design) + 1
+        n_mutation_n = np.random.poisson(1, size=n_design) + 1
         seq_n = [add_mutations(seed_seq, n_mut) for n_mut in n_mutation_n]
         # initializing with training sequences yields very similar results
         # init_idx = np.random.choice(len(self.trainseq_n), n_design, replace=True)
