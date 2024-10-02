@@ -146,11 +146,11 @@ def train_models(
         seed_idx = 3,
         p_mutation: float = 0.08,
         noise_sd: float = 0.02,
-        n_hidden: int = 10,
+        n_hidden: int = 100,
         n_epoch: int = 5,
         lr: float = 0.001,
         n_filters: int = 32,
-        save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/rna-models',
+        save_path: str = '/data/wongfanc/rna-models',
         save_fname_no_ftype: str = None,
     ):
     """
@@ -221,7 +221,7 @@ def label_design_sequences(
         binding_target_idx, seed_idx, noise_sd
     ))
 
-    print('Loading/saving name2designdata to {}'.format(design_pkl_fname))
+    print('Loading/saving labeled name2designdata to {}'.format(design_pkl_fname))
     with open(design_pkl_fname, 'rb') as f:
         name2designdata = pickle.load(f)
 
@@ -256,13 +256,14 @@ def label_design_sequences(
             ))
 
 
-def sample_design_sequences(  # TODO: config/hydra
+def sample_design_sequences(
     n_design: int,
     adalead_thresholds,
     biswas_temperatures,
     cbas_dbas_quantiles,
+    dbas_ridge_quantiles,
     model_and_data_fname_no_ftype: str,
-    model_and_data_path: str = '/homefs/home/wongfanc/density-ratio-estimation/rna-models',
+    model_and_data_path: str = '/data/wongfanc/rna-models',
     seed_idx: int = 3,
     design_pkl_fname: str = None,
     intermediate_iter = None,
@@ -330,7 +331,7 @@ def sample_design_sequences(  # TODO: config/hydra
         quantile = round(quantile, 2)
 
         # design sequences
-        print(f'Designing CbAS {quantile} ridge sequences from intermediate iterations...')
+        print('Designing CbAS {} ridge sequences from intermediate iterations {}...'.format(quantile, intermediate_iter))
         t0 = time()
         cbas_iter2designseq = cbas.design_sequences_from_intermediate_iterations(
             n_design,
@@ -360,11 +361,11 @@ def sample_design_sequences(  # TODO: config/hydra
         weight_type='dbas',
         device='cuda'
     )
-    for quantile in cbas_dbas_quantiles:
+    for quantile in dbas_ridge_quantiles:
         quantile = round(quantile, 2)
 
         # design sequences
-        print(f'Designing DbAS {quantile} ridge sequences...')
+        print('Designing DbAS {} ridge sequences from intermediate iterations {}...'.format(quantile, intermediate_iter))
         t0 = time()
         dbas_iter2designseq = dbas.design_sequences_from_intermediate_iterations(
             n_design,
@@ -384,6 +385,39 @@ def sample_design_sequences(  # TODO: config/hydra
                     pickle.dump(name2designs, f)
                 print(f'  Saved {n_design} DbAS {quantile} t = {it} ridge sequences.')
             print()
+
+    # ----- DbAS with other models, no intermediate iterations -----
+    for model_name, model in name2model.items():
+        if model_name != 'ridge':
+            dbas = designers.CbAS(
+                model,
+                trainseq_n,
+                latent_dim=latent_dim,
+                n_hidden=n_vae_hidden,
+                weight_type='dbas',
+                device='cuda'
+            )
+            for quantile in cbas_dbas_quantiles:
+                quantile = round(quantile, 2)
+
+                # design sequences
+                print(f'Designing DbAS {quantile} {model_name} sequences...')
+                t0 = time()
+                dbas_n = dbas.design_sequences(
+                    n_design,
+                    quantile=quantile
+                )
+                print(f'  Done. ({int(time() - t0)} s)')
+                # store
+                preddbas_n = model.predict(dbas_n)
+                print('  Mean prediction: {:.3f}'.format(np.mean(preddbas_n)))
+                name2designs[f'dbas-{model_name}-{quantile}'] = (dbas_n, None, preddbas_n)
+                # save
+                if design_pkl_fname is not None:
+                    with open(design_pkl_fname, 'wb') as f:
+                        pickle.dump(name2designs, f)
+                    print(f'  Saved {n_design} DbAS {quantile} {model_name} sequences.')
+                print()
     
 
     # all other design algorithms
@@ -422,6 +456,33 @@ def sample_design_sequences(  # TODO: config/hydra
                 print(f'  Saved {n_design} AdaLead threshold = {threshold} {model_name} sequences.')
             print()
 
+        # ===== PEX =====
+        pex = designers.PEX(
+            model,
+            trainseq_n,
+            ytrain_n,
+            RNABinding.SEEDS[seed_idx],
+        )
+        # design sequences
+        print(f'Designing PEX {model_name} sequences...')
+        t0 = time()
+        pex_n = pex.design_sequences(
+            n_design,
+            p_mutation_pex,
+        )
+        print(f'  Done. ({int(time() - t0)} s)')
+        # store
+        predpex_n = model.predict(pex_n)
+        # ypex_n = landscape.get_fitness(pex_n)
+        print('  Mean prediction: {:.3f}'.format(np.mean(predpex_n)))
+        name2designs[f'pex-{model_name}'] = (pex_n, None, predpex_n)
+        # save
+        if design_pkl_fname is not None:
+            with open(design_pkl_fname, 'wb') as f:
+                pickle.dump(name2designs, f)
+            print(f'  Saved {n_design} PEX {model_name} sequences.')
+        print()
+
         # ===== Biswas =====
         biswas = designers.Biswas(model, trainseq_n)
         for temp in biswas_temperatures:
@@ -455,67 +516,115 @@ def sample_design_sequences(  # TODO: config/hydra
                 print(f'  Saved {n_design} Biswas temperature = {temp} {model_name} sequences.')
             print()
 
-        if model_name != 'ridge':
-
-            # ===== DbAS =====
-            dbas = designers.CbAS(
-                model,
-                trainseq_n,
-                latent_dim=latent_dim,
-                n_hidden=n_vae_hidden,
-                weight_type='dbas',
-                device='cuda'
-            )
-            for quantile in cbas_dbas_quantiles:
-                quantile = round(quantile, 2)
-
-                # design sequences
-                print(f'Designing DbAS {quantile} {model_name} sequences...')
-                t0 = time()
-                dbas_n = dbas.design_sequences(
-                    n_design,
-                    quantile=quantile
-                )
-                print(f'  Done. ({int(time() - t0)} s)')
-                # store
-                preddbas_n = model.predict(dbas_n)
-                print('  Mean prediction: {:.3f}'.format(np.mean(preddbas_n)))
-                name2designs[f'dbas-{model_name}-{quantile}'] = (dbas_n, None, preddbas_n)
-                # save
-                if design_pkl_fname is not None:
-                    with open(design_pkl_fname, 'wb') as f:
-                        pickle.dump(name2designs, f)
-                    print(f'  Saved {n_design} DbAS {quantile} {model_name} sequences.')
-                print()
-
-
-        # ===== PEX =====
-        pex = designers.PEX(
-            model,
-            trainseq_n,
-            ytrain_n,
-            RNABinding.SEEDS[seed_idx],
-        )
-        # design sequences
-        print(f'Designing PEX {model_name} sequences...')
-        t0 = time()
-        pex_n = pex.design_sequences(
-            n_design,
-            p_mutation_pex,
-        )
-        print(f'  Done. ({int(time() - t0)} s)')
-        # store
-        predpex_n = model.predict(pex_n)
-        # ypex_n = landscape.get_fitness(pex_n)
-        print('  Mean prediction: {:.3f}'.format(np.mean(predpex_n)))
-        name2designs[f'pex-{model_name}'] = (pex_n, None, predpex_n)
-        # save
-        if design_pkl_fname is not None:
-            with open(design_pkl_fname, 'wb') as f:
-                pickle.dump(name2designs, f)
-            print(f'  Saved {n_design} PEX {model_name} sequences.')
-    
     return name2designs
+
+
+def run_imputation_selection_experiments(
+    design_names,
+    n_trial: int,
+    design_pkl_fname_no_trial: str,
+    model_and_data_fname_no_ftype: str,
+    target_values: np.array,
+    intermediate_iter_threshold: float = 0.1,
+    n_hidden: int = 100,
+    n_filters: int = 32,
+    results_csv_fname: str = None,
+    model_and_data_path: str = '/data/wongfanc/rna-models'  
+):
+    # load design sequences
+    # and prepare intermediate iterations for C/DbAS
+    train_fname = os.path.join(model_and_data_path, 'traindata-' + model_and_data_fname_no_ftype + '.npz')
+
+    # ===== load models =====
+    # load training data and fit ridge regression
+    d = np.load(train_fname)
+    trainseqs_n = list(d['trainseq_n'])
+    ytrain_n = d['ytrain_n']
+    ridge = ridge = models.RidgeRegressor(seq_len=50, alphabet=RNA_NUCLEOTIDES)
+    ridge.fit(trainseqs_n, ytrain_n)
+
+    # load trained FF and CNN models
+    ff_fname = os.path.join(model_and_data_path, 'ff-' + model_and_data_fname_no_ftype + '.pt')
+    ff = models.FeedForward(50, RNA_NUCLEOTIDES, n_hidden)
+    ff.load(ff_fname)
+    cnn_fname = os.path.join(model_and_data_path, 'cnn-' + model_and_data_fname_no_ftype + '.pt')
+    cnn = models.CNN(50, RNA_NUCLEOTIDES, n_filters, n_hidden)
+    cnn.load(cnn_fname)
+    name2model = {
+        'ridge': ridge,
+        'ff': ff,
+        'cnn': cnn
+    }
+
+    # dataframe to record selection experiment results
+    imp_selected_column_names = ['tr{}_imp_pval_{}'.format(i, name) for i in range(n_trial) for name in design_names]
+    target_values = [round(val, 4) for val in target_values]
+    df = DataFrame(index=target_values, columns=imp_selected_column_names)
+
+    t0 = time()
+    name2truemeans = {design_name: [] for design_name in design_names}
+    results_pkl_fname = results_csv_fname[: -4] + '-truemeans.pkl'
+    # ===== run selection experiments =====
+    for i in range(n_trial):
+
+        # ----- load design sequences -----
+        design_pkl_fname = design_pkl_fname_no_trial + '-{}.pkl'.format(i)
+        # make sure designs have labels, add training data, select intermediate C/DbAS ridge iterations
+        name2designdata = prepare_name2designdata(  
+            design_pkl_fname,
+            train_fname,
+            intermediate_iter_threshold=intermediate_iter_threshold,
+            verbose=False
+        )
+
+        assert('train' in name2designdata)
+        (trainseqs_n, ytrain_n, predtrain_n) = name2designdata['train']
+        assert(predtrain_n is None)
+
+        # print('All design names in provided design data:')
+        # for name in name2designdata:
+        #     print(name)
+        # print()
+            
+        # name2designdata may contain other distributions used to faciliate DRE,
+        # but which we are not interested in designs from
+        for name in design_names:
+            assert(name in name2designdata)
+
+        # ----- imputation selection experiments -----
+        for design_name in design_names:
+            (_, ydesign_n, preddesign_n) = name2designdata[design_name]
+            imputed_mean = np.mean(preddesign_n)
+            imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
+            name2truemeans[design_name].append(np.mean(ydesign_n))
+
+            for target_val in target_values:
+                # get imputation p-value
+                imp_pval = _zstat_generic(
+                    imputed_mean,
+                    0,
+                    imputed_se,
+                    alternative='larger',
+                    diff=target_val
+                )[1]
+
+                df.loc[target_val]['tr{}_imp_pval_{}'.format(i, design_name)] = imp_pval
+    
+    if results_csv_fname is not None:
+        df.to_csv(results_csv_fname, index_label='target_value')  # time sink
+        with open(results_pkl_fname, 'wb') as f:
+            pickle.dump(name2truemeans, f)
+        print('Saved to {} and {} ({} s).\n'.format(results_csv_fname, results_pkl_fname, int(time() - t0)))
+    
+    format_tokens = '{:.4f} '
+    format_str = '  {}: ' + ''.join(n_trial * [format_tokens])
+    print('High-ish variance estimates of true mean labels for:')
+    for name, truemean_t in name2truemeans.items():
+        vmin, vmax = np.min(truemean_t), np.max(truemean_t)
+        if (vmax - vmin) / vmax > 0.05 * vmax:
+            print(format_str.format(name, *truemean_t))
+
+    return df, name2truemeans
 
 
 def run_selection_experiments(
@@ -533,9 +642,10 @@ def run_selection_experiments(
     n_mdre_epoch: int = 100,
     n_cal: int = 5000,
     results_csv_fname: str = None,
-    model_and_data_path: str = '/homefs/home/wongfanc/density-ratio-estimation/rna-models',
+    model_and_data_path: str = '/data/wongfanc/rna-models',
     device = None,
 ):
+    print('TODO: build and save pp_name2truemeans')
     # load design sequences
     # and prepare intermediate iterations for C/DbAS
     train_fname = os.path.join(model_and_data_path, 'traindata-' + model_and_data_fname_no_ftype + '.npz')

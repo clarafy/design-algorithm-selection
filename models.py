@@ -40,7 +40,7 @@ class ExceedancePredictor():
     def __init__(self, model, threshold: float) -> None:
         self.model = model
         self.threshold = threshold
-        self.lr = LogisticRegression(class_weight='balanced')
+        self.lr = LogisticRegression(class_weight=None, warm_start=False, penalty=None)
         self.lr_fitted = False
 
     def fit(self, ohe_nxlxa: np.array, binary_y_n: np.array):
@@ -187,13 +187,13 @@ class EnrichmentFeedForward(torch.nn.Module):
         tohe_nxla = torch.flatten(tohe_nxlxa, start_dim=1)
         return self(tohe_nxla).cpu().detach().numpy()
     
-    def save(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-models'):
+    def save(self, save_fname_no_ftype, save_path: str = '/data/wongfanc/gb1-models'):
         Path(save_path).mkdir(parents=True, exist_ok=True)
         fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
         torch.save(self.state_dict(), fname)
         print('Saved models to {}.'.format(fname))
     
-    def load(self, save_fname_no_ftype, save_path: str = '/homefs/home/wongfanc/density-ratio-estimation/gb1-models'):
+    def load(self, save_fname_no_ftype, save_path: str = '/data/wongfanc/gb1-models'):
         fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
         self.load_state_dict(torch.load(fname))
 

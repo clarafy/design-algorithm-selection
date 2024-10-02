@@ -129,6 +129,11 @@ class CbAS(Designer):
         self.design_distribution_fitted = True
         self.fitted_quantile = quantile
         return df
+
+    def sample_from_train_distribution(self, n_sample: int):
+        # sample from the VAE fit to the training distribution
+        seq_n, _, _ = self.train_vae.generate(n_sample)
+        return seq_n
     
     def design_sequences(
             self,

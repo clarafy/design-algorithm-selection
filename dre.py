@@ -388,24 +388,26 @@ def prepare_name2designdata(
         print(f'Loaded {ytrain_n.size} training points from {train_fname}.\n')
     name2designdata['train'] = (trainseqs_n, ytrain_n, None)
 
-    # remove DbAS q > 0.6
-    for threshold in np.arange(0.7, 0.91, 0.1):
+    # remove DbAS q > 0.3
+    for threshold in np.arange(0.3, 0.91, 0.1):
         for it in range(20):
             name = 'dbas-ridge-{:.1f}t{}'.format(threshold, it)
-            del name2designdata[name]
-            if verbose:
-                print(f'Removed {name} designs.')
+            if name in name2designdata:
+                del name2designdata[name]
+                if verbose:
+                    print(f'Removed {name} designs.')
     
     # remove Biswas
-    for temperature in [0.05]:
+    for temperature in [0.05, 0.03]:
         temp = round(temperature, 4)
         for model_name in ['ridge', 'ff', 'cnn']:
             name = f'biswas-{model_name}-{temp}'
-            del name2designdata[name]
-            if verbose:
-                print(f'Removed {name} designs.')
+            if name in name2designdata:
+                del name2designdata[name]
+                if verbose:
+                    print(f'Removed {name} designs.')
 
-    # select intermediate C/DbAS iterations to facilitate DRE for C/DbAS design distributions
+    # select intermediate C/DbAS ridge iterations to facilitate DRE for C/DbAS ridge design distributions
     for threshold in np.arange(0.1, 1, 0.1):
         for weight_type in ['c', 'd']:
             prefix =  '{}bas-ridge-{:.1f}'.format(weight_type, threshold)
@@ -421,9 +423,10 @@ def prepare_name2designdata(
                     print(f'Using the following iterations for {prefix}: {iters}.')
                     
                 for name in names_to_remove:
-                    del name2designdata[name] 
-                    if verbose:
-                        print(f'  Removed {name}')
+                    if name in name2designdata:
+                        del name2designdata[name] 
+                        if verbose:
+                            print(f'  Removed {name}')
                     
     if verbose:
         print('Design names:')
