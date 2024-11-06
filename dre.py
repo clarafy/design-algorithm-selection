@@ -50,16 +50,17 @@ class MultiMDRE():
                 group_idx = self._name2idx(name)
                 assert(name not in idx2group[group_idx])
                 idx2group[group_idx][name] = data
+        
+        for i, name2dd in idx2group.items():
+            # if no design algorithms were assigned to this group, raise error
+            if len(name2dd) == 1:
+                assert('train' in name2dd)
+                group_str = self.group_regex_strs[i]
+                raise ValueError('Group {} has no design algorithms in name2designdata.'.format(group_str))
 
         # fit MDRE per group
         for i, name2dd in idx2group.items():
             group_str = self.group_regex_strs[i]
-
-            # if no design algorithms were assigned to this group, raise error
-            if len(name2dd) == 1:
-                assert('train' in name2dd)
-                raise ValueError('Group {} has no design algorithms in name2designdata.'.format(group_str))
-            
             if verbose:
                 print('Fitting MDRE for {}, which has {} design algorithms:'.format(group_str, len(name2dd) - 1))
                 for name in name2dd:
@@ -308,7 +309,7 @@ def select_intermediate_iterations(
         name = '{}t{}'.format(design_name_prefix, i)
         all_names.append(name)
         if name not in name2designdata:
-            print(f'No design data for {name}, exiting.')
+            print(f'No design data for {name}, exiting MDRE select_intermediate_iterations.')
             return None
     
     # find interval between iterations where the mean difference in consecutive mean predictions
@@ -372,6 +373,8 @@ def prepare_name2designdata(
         intermediate_iter_threshold: float = 0.1,
         verbose: bool = True,
     ):
+    # removes extraneous distributions that we aren't interested in testing
+    # (except for intermediate iters for C/DbAS)
 
     # load labeled designs from all design algorithms
     with open(design_pkl_fname, 'rb') as f:

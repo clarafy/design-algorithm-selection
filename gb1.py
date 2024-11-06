@@ -197,7 +197,7 @@ def get_nostop_normalizing_constant(logp_lxa: np.array):
 def get_nostop_loglikelihood(ohe_nxlxa: np.array, p_lxa: np.array):
     """
     Calculates the log-probability of OHE sequences, accounting for rejecting sequences with stop codons,
-    given the probabiliies of site-wise categorical distributions.
+    given the probabilities of site-wise categorical distributions.
     """
     logp_lxa = np.log(p_lxa)
     normalizing_const = get_nostop_normalizing_constant(logp_lxa)

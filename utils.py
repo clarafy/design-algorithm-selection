@@ -138,7 +138,8 @@ def process_rna_selection_experiments(
 ):
     n_config = len(design_names)
     alpha_bonferroni = alpha / n_config
-    assert(set(design_names) == set(name2truemeans.keys()))
+    for name in design_names:
+        assert(name in name2truemeans)
     print('Processing {} results with the following {} configurations, {} target values in [{:.2f}, {:.2f}], {} trials, and alpha = {:.1f}:'.format(
         imp_or_pp, n_config, target_values.shape[0], np.min(target_values), np.max(target_values), n_trial, alpha
     ))
@@ -185,7 +186,7 @@ def process_rna_selection_experiments(
         val2configs[val] = configs_t
         
         if (v + 1) % 20 == 0:
-            print('Done processing {} / {} ({} s)'.format(v + 1, target_values.size, int(time() - t0)))
+            print('Done processing {} / {} target values ({} s)'.format(v + 1, target_values.size, int(time() - t0)))
 
     print('Done processing ({} s)'.format(int(time() - t0)))
     return worst_v, err_v, disc_v, val2configs
