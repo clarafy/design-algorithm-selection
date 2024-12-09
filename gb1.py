@@ -10,7 +10,7 @@ from statsmodels.stats.weightstats import _zstat_generic
 from Bio.Seq import Seq
 
 from models import EnrichmentFeedForward, ExceedancePredictor
-import utils
+from utils import str2onehot, get_conformal_prediction_lower_bound, editdistance, ohes2strs, wheelock_mean_forecast
 from calibrate import rectified_p_value
 
 # TODO: move constants to a util.py if rna.py also has
@@ -43,12 +43,13 @@ AA2IDX = {aa: idx for idx, aa in enumerate(AA)}
 
 AA_NOSTOP = ''.join([aa for aa in AA2CODON.keys() if aa != '*'])
 ALL_NOSTOP_AA_SEQS = [''.join(aas) for aas in product(*(4 *[AA_NOSTOP]))]
-ALL_NOSTOP_AA_OHE = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
+ALL_NOSTOP_AA_OHE = np.stack([str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
+WT_GB1 = 'vdgv'
 
 NUCLEOTIDES = 'atcg'
 NUC2IDX = {nuc: idx for idx, nuc in enumerate(NUCLEOTIDES)}
 
-df = read_csv('../data/gb1-with-variance.csv')
+df = read_csv('/homefs/home/wongfanc/density-ratio-estimation/data/gb1-with-variance.csv')
 seq_n = list(df['Variants'].str.lower())
 y_n = df['log_fitness'].to_numpy()
 var_n = df['estimated_variance'].to_numpy()
@@ -316,7 +317,7 @@ def get_true_mean_label_from_theta(temp2theta, threshold: float = None, verbose:
     if verbose:
         print('True mean for temperature...')
     t0 = time()
-    ohe_nxlxa = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
+    ohe_nxlxa = np.stack([str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
     for temp, theta_lxa in temp2theta.items():
         paa_lxa = get_aa_probs_from_nuc_probs(normalize_theta(theta_lxa))
         pdesign_n = np.exp(get_nostop_loglikelihood(ohe_nxlxa, paa_lxa))
@@ -335,25 +336,40 @@ def run_imputation_selection_experiments(
     temp2theta,
     target_values: np.array,
     n_trial: int,
+    trainseq_n,
+    ytrain_n: np.array,
+    wheelock_forecast_qs,
     exceedance_threshold: float = None,
     n_design: int = 1000000,
     save_path: str = '/data/wongfanc/gb1-results',
-    results_csv_fname: str = None,
+    imp_csv_fname: str = None,
+    n_wheelock_designs: int = 100000,
+    wheelock_csv_fname: str = None,
     design_samples_fname_prefix: str = None,
     load_design_samples: bool = False,
     save_design_samples: bool = False
 ):
     
-    temperatures = list(temp2theta.keys())
+    if imp_csv_fname is not None:
+        assert(wheelock_csv_fname is not None)
+    if wheelock_csv_fname is not None:
+        assert(imp_csv_fname is not None)
+        
+    temperatures = [round(t, 4) for t in list(temp2theta.keys())]
     target_values = np.array([round(v, 4) for v in target_values])
     imp_selected_column_names = ['tr{}_imp_pval_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
     df = DataFrame(
         index=target_values, columns=imp_selected_column_names
     )
 
-    if results_csv_fname is not None:
-        Path(save_path).mkdir(parents=True, exist_ok=True)
-        results_fname = os.path.join(save_path, results_csv_fname)
+    # dataframe for Wheelock forecasting results
+    wf_column_names = ['wf_mean_q{:.2f}_temp{:.4f}'.format(q, temp) for q in wheelock_forecast_qs for temp in temperatures]
+    wf_cs_column_names = ['wf_mean_q{:.2f}_cs_temp{:.4f}'.format(q, temp) for q in wheelock_forecast_qs for temp in temperatures]
+    wf_df = DataFrame(index=range(n_trial), columns=wf_column_names + wf_cs_column_names)
+
+    # predictions on training data and edit distance from WT for Wheelock forecasts
+    predtrain_n = model.predict(trainseq_n)
+    trained_n = np.array([editdistance.eval(WT_GB1, seq) for seq in trainseq_n])
 
     if load_design_samples and save_design_samples:
         raise ValueError('Only one of load_design_samples or save_design_samples can be True.') 
@@ -382,6 +398,7 @@ def run_imputation_selection_experiments(
                 design_samples_fname = os.path.join(save_path, '{}-t{:.4f}-{}.npz'.format(design_samples_fname_prefix, temp, i))
                 d = np.load(design_samples_fname)
                 designohe_nxlxa = d['designohe_nxlxa']
+                designed_n = d['designed_n']
                 if designohe_nxlxa.shape[0] != n_design:
                     raise ValueError('Loaded {} != n_design = {} design sequences from {}.'.format(
                         designohe_nxlxa.shape[0], n_design, design_samples_fname
@@ -392,6 +409,8 @@ def run_imputation_selection_experiments(
                 _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
                     theta_lxa, n_design, normalize=True, reject_stop_codon=True
                 )
+                designseq_N = ohes2strs(designohe_nxlxa, AA)  # TODO: memory probably can't handle all of this
+                designed_n = np.array([editdistance.eval(WT_GB1, seq) for seq in designseq_N])
                 print('Sampled {} design sequences for temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
                 if save_design_samples:
                     design_samples_fname = os.path.join(save_path, '{}-t{:.4f}-{}.npz'.format(design_samples_fname_prefix, temp, i))
@@ -412,45 +431,71 @@ def run_imputation_selection_experiments(
                     diff=target_val
                 )[1]
                 df.loc[target_val]['tr{}_imp_pval_temp{:.4f}'.format(i, temp)] = imp_pval
+            
+            # ===== Wheelock forecast ===== 
+            # subsample to avoid OOM
+            samp_idx = np.random.choice(preddesign_n.size, size=(n_wheelock_designs), replace=False)
+            designp_N, designped_N, q2functionalmus, designmuneg_N = wheelock_mean_forecast(
+                ytrain_n, predtrain_n, trained_n, preddesign_n[samp_idx], designed_n[samp_idx], qs=wheelock_forecast_qs
+            )
+
+            # record forecast
+            for q, (designmutilde_N, designmued_N) in q2functionalmus.items():
+                # w/o correction for covariate shift
+                forecast_tilde = np.mean(designp_N * designmutilde_N + (1 - designp_N) * designmuneg_N)
+                wf_df.loc[i]['wf_mean_q{:.2f}_temp{:.4f}'.format(q, temp)] = forecast_tilde
+
+                # w/ correction to p and \tilde{\mu} for covariate shift,
+                # based on edit distance to the seed sequence
+                forecast_ed = np.mean(designped_N * designmued_N + (1 - designped_N) * designmuneg_N)
+                wf_df.loc[i]['wf_mean_q{:.2f}_cs_temp{:.4f}'.format(q, temp)] = forecast_ed
+                print('Temp {:.4f}, trial {}, q = {}. Wheelock forecast {:.3f}, w/ covariate shift {:.3f}'.format(
+                    temp, i, q, forecast_tilde, forecast_ed
+                ))
         
         print('Done with temperature {:.4f} ({} / {}) ({} s)'.format(
             temp, t + 1, len(temperatures), int(time() - t0))
         )
-        if results_csv_fname is not None:
-            df.to_csv(results_fname) # time sink
-            print('Saved to {} ({} s).'.format(results_fname, int(time() - t0)))
+        if imp_csv_fname is not None:
+            df.to_csv(imp_csv_fname)
+            wf_df.to_csv(wheelock_csv_fname, index_label='trial')
+            print('Saved to {} and {} ({} s).'.format(imp_csv_fname, wheelock_csv_fname, int(time() - t0)))
     
     return df
 
     
-def run_temperature_selection_experiments(
+def run_pp_temperature_selection_experiments(
     model: EnrichmentFeedForward,
     temp2theta,
     target_values: np.array,
     exceedance_threshold: float = None,
     n_cal: int = 5000,
     n_design: int = 1000000,
-    n_trial: int = 1000,
+    n_trial: int = 200,
+    alpha: float = 0.1,
     n_train_lr: int = 500,
     self_normalize_weights: bool = True,
+    cp_batch_sz: int = 10000,
     save_path: str = '/data/wongfanc/gb1-results',
-    results_csv_fname: str = None,
+    pp_csv_fname: str = None,
+    cp_csv_fname: str = None,
     design_samples_fname_prefix: str = None,
     load_design_samples: bool = False,
     save_design_samples: bool = False
 ):
     
-    temperatures = list(temp2theta.keys())
+    temperatures = [round(t, 4) for t in temp2theta.keys()]
     target_values = np.array([round(v, 4) for v in target_values])
-    imp_selected_column_names = ['imp_pval_temp{:.4f}'.format(temp) for temp in temperatures]
     pp_selected_column_names = ['tr{}_pp_pval_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
+    cp_column_names = ['cp_lb_temp{:.4f}'.format(temp) for temp in temperatures]
+    cp_nobonf_column_names = ['cp_nobonf_lb_temp{:.4f}'.format(temp) for temp in temperatures]
     df = DataFrame(
-        index=target_values, columns=imp_selected_column_names + pp_selected_column_names
+        index=target_values, columns=pp_selected_column_names
     )
+    cp_df = DataFrame(index=range(n_trial), columns=cp_column_names + cp_nobonf_column_names)
 
-    if results_csv_fname is not None:
-        Path(save_path).mkdir(parents=True, exist_ok=True)
-        results_fname = os.path.join(save_path, results_csv_fname)
+    if pp_csv_fname is not None:
+        assert(cp_csv_fname is not None)
 
     if load_design_samples and save_design_samples:
         raise ValueError('Only one of load_design_samples or save_design_samples can be True.') 
@@ -467,11 +512,12 @@ def run_temperature_selection_experiments(
         # seq2y = SEQ2YVAR
     print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(np.min(target_values), np.max(target_values)))
 
-    
-    t0 = time() 
+
+    # ===== PP temperature selection experiments =====
+    t0 = time()
     for t, (temp, theta_lxa) in enumerate(temp2theta.items()):
 
-        # sampling design sequences is the bottleneck for computation
+        # ----- load or sample designs -----
         if load_design_samples:
             design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
             d = np.load(design_samples_fname)
@@ -492,25 +538,26 @@ def run_temperature_selection_experiments(
                 np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
                 print('Saved design samples to {}.'.format(design_samples_fname))
             
-        # predictions for unlabeled design sequences
+
+        # ----- predictions for designs -----
         if exceedance_threshold is not None:
             predictor = ExceedancePredictor(model, exceedance_threshold)
-        preddesign_n = predictor.predict(designohe_nxlxa)
-        imputed_mean = np.mean(preddesign_n)
-        imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
+        preddesign_N = predictor.predict(designohe_nxlxa)
+        imputed_mean = np.mean(preddesign_N)
+        imputed_se = np.std(preddesign_N) / np.sqrt(preddesign_N.size)
 
-        for target_val in target_values:
 
-            # imputation hypothesis test. only run one trial since N so large
-            imp_pval = _zstat_generic(
-                imputed_mean,
-                0,
-                imputed_se,
-                alternative='larger',
-                diff=target_val
-            )[1]
-            df.loc[target_val]['imp_pval_temp{:.4f}'.format(temp)] = imp_pval
+        # ----- get density ratio weights for N designs (for CP baseline) -----
+        designlogptrain_N = get_nostop_loglikelihood(designohe_nxlxa, PAA_NNK_LXA)
+        designdr_N = get_density_ratios(designohe_nxlxa, theta_lxa, logptrain_n=designlogptrain_N)
+        if self_normalize_weights:
+            designdr_N = designdr_N / np.sum(designdr_N) * designdr_N.size
+        print('Done getting density ratios for design sequences from temperature {:.4f}. ({} s)'.format(
+            temp, int(time() - t0)
+        ))
 
+
+        # ----- experiments with randomness over calibration data -----
         for i in range(n_trial):
 
             # sample labeled calibration data from NNK
@@ -519,6 +566,7 @@ def run_temperature_selection_experiments(
             )
             ycal_n = np.array([SEQ2YVAR[seq][0] for seq in calseq_n])
 
+            # ----- train exceedance predictor -----
             if exceedance_threshold is not None:
                 ycal_n = (ycal_n >= exceedance_threshold).astype(float)
                 sampled_both_labels = False
@@ -541,13 +589,11 @@ def run_temperature_selection_experiments(
                 imputed_mean = np.mean(preddesign_n)
                 imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
 
-            # ----- quantities for prediction-powered hypothesis test -----
-
             # predictions for calibration sequences
             predcal_n = predictor.predict(calohe_nxlxa)
             callogptrain_n = get_nostop_loglikelihood(calohe_nxlxa, PAA_NNK_LXA)
 
-            # density ratios on labeled calibration sequences
+            # density ratios on calibration sequences
             caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa, logptrain_n=callogptrain_n)
             # cal_ess = np.square(np.sum(caldr_n)) / np.sum(np.square(caldr_n))
             if self_normalize_weights:
@@ -558,151 +604,41 @@ def run_temperature_selection_experiments(
             rectifier_mean = np.mean(rect_n)
             rectifier_se = np.std(rect_n) / np.sqrt(rect_n.size)
 
-            for target_val in target_values:
+            # get prediction-powered p-values for each desired threshold value
+            # for target_val in target_values:
+            #     pp_pval = rectified_p_value(
+            #         rectifier_mean,
+            #         rectifier_se,
+            #         imputed_mean,
+            #         imputed_se,
+            #         null=target_val,
+            #         alternative='larger'
+            #     )
+            #     df.loc[target_val]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
 
-                # run prediction-powered hypothesis test
-                pp_pval = rectified_p_value(
-                    rectifier_mean,
-                    rectifier_se,
-                    imputed_mean,
-                    imputed_se,
-                    null=target_val,
-                    alternative='larger'
-                )
-                df.loc[target_val]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
+            # ----- conformal prediction-based baseline -----
+            # CP-based lower bound
+            lb, lb_nobonf = get_conformal_prediction_lower_bound(
+                ycal_n, predcal_n, caldr_n, preddesign_N, designdr_N,
+                alpha=alpha / len(temperatures), batch_sz=cp_batch_sz
+            )
+            # conformal prediction-based test outcomes (reject/fail to reject)
+            cp_df.loc[i, 'cp_lb_temp{:.4f}'.format(temp)] = lb
+            cp_df.loc[i, 'cp_nobonf_lb_temp{:.4f}'.format(temp)] = lb_nobonf
+            if lb_nobonf > -np.inf:
+                print('Temp {:.4f}, trial {} has CP-based LBs {:.4f} (Bonferroni), {:.4f} (uncorrected) ({} s)'.format(
+                    temp, i, lb, lb_nobonf, int(time() - t0)
+                ))
+
                     
-        print('Done with {} / {} trials for temperature {:.4f} ({} / {}) ({} s).'.format(
-            n_trial, n_trial, temp, t + 1, len(temperatures), int(time() - t0)
+        print('Done with {} trials for temperature {:.4f} ({} / {}) ({} s).'.format(
+            n_trial, temp, t + 1, len(temperatures), int(time() - t0)
         ))
-        if results_csv_fname is not None:
-            df.to_csv(results_fname) # time sink
-            print('Saved to {} ({} s).\n'.format(results_fname, int(time() - t0)))
+        if pp_csv_fname is not None:
+            df.to_csv(pp_csv_fname) # time sink
+            cp_df.to_csv(cp_csv_fname)
+            print('Saved PP results to {}.'.format(pp_csv_fname))
+            print('Saved CP results to {} ({} s).\n'.format(cp_csv_fname, int(time() - t0)))
 
-    return df
+    return df, cp_df
 
-
-def run_temperature_selection_experiments_maxt(
-    model: EnrichmentFeedForward,
-    temp2theta,
-    target_values: np.array,
-    n_cal: int = 5000,
-    n_design: int = 1000000,
-    n_trial: int = 1000,
-    n_bootstrap: int = 10000,
-    self_normalize_weights: bool = True,
-    save_path: str = '/data/wongfanc/gb1-results',
-    results_csv_fname: str = None,
-    design_samples_fname_prefix: str = None,
-):
-    
-    temperatures = list(temp2theta.keys())
-    target_values = np.array([round(v, 4) for v in target_values])
-    imp_selected_column_names = ['imp_pval_temp{:.4f}'.format(temp) for temp in temperatures]
-    pp_selected_column_names = ['tr{}_pp_pval_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
-    df = DataFrame(index=target_values, columns=imp_selected_column_names + pp_selected_column_names)
-
-    if results_csv_fname is not None:
-        Path(save_path).mkdir(parents=True, exist_ok=True)
-        results_fname = os.path.join(save_path, results_csv_fname)
-        
-    print('Selection quantity is the mean label.')
-    predictor = model
-    print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(np.min(target_values), np.max(target_values)))
-
-    # ===== imputation =====
-    t0 = time()
-    imputed_mean_se_tx2 = np.zeros([len(temperatures), 2])
-    for t, (temp, theta_lxa) in enumerate(temp2theta.items()):
-
-        # sampling design sequences is the bottleneck for computation
-        design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
-        d = np.load(design_samples_fname)
-        designohe_nxlxa = d['designohe_nxlxa']
-        if designohe_nxlxa.shape[0] != n_design:
-            raise ValueError('Loaded {} != n_design = {} design sequences from {}.'.format(
-                designohe_nxlxa.shape[0], n_design, design_samples_fname
-            ))
-        print('Loaded {} design sequences from {}.'.format(n_design, design_samples_fname))
-            
-        # predictions for unlabeled design sequences
-        preddesign_n = predictor.predict(designohe_nxlxa)
-        imputed_mean = np.mean(preddesign_n)
-        imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
-        imputed_mean_se_tx2[t] = imputed_mean, imputed_se
-
-        for target_val in target_values:
-
-            # imputation hypothesis test. only run one trial since N so large
-            imp_pval = _zstat_generic(
-                imputed_mean,
-                0,
-                imputed_se,
-                alternative='larger',
-                diff=target_val
-            )[1]
-            df.loc[target_val]['imp_pval_temp{:.4f}'.format(temp)] = imp_pval
-
-    # ===== PP =====
-    t0 = time()
-    for i in range(n_trial):
-
-        # ----- sample labeled calibration data from NNK -----
-        _, calohe_nxlxa, calseq_n = sample_ohe_from_nuc_distribution(
-            PNUC_NNK_LXA, n_cal, normalize=False, reject_stop_codon=True
-        )
-        ycal_n = np.array([SEQ2YVAR[seq][0] for seq in calseq_n])
-
-        # predictions for calibration sequences
-        predcal_n = predictor.predict(calohe_nxlxa)
-        callogptrain_n = get_nostop_loglikelihood(calohe_nxlxa, PAA_NNK_LXA)
-
-        # ---- PP point estimate for each temperature -----
-        thetahat_t = np.zeros([len(temperatures)])
-        caldr_txn = np.zeros([len(temperatures), n_cal])
-        for t, (temp, theta_lxa) in enumerate(temp2theta.items()):
-
-            # density ratios on labeled calibration sequences
-            caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa, logptrain_n=callogptrain_n)
-            caldr_txn[t] = caldr_n
-            if self_normalize_weights:
-                caldr_n = caldr_n / np.sum(caldr_n) * caldr_n.size
-        
-            # rectifier sample mean and standard error
-            rect_n = caldr_n * (ycal_n - predcal_n)
-            rectifier_mean = np.mean(rect_n)
-
-            # PP point estimate
-            thetahat_t[t] = imputed_mean_se_tx2[t, 0] + rectifier_mean
-
-        # --- bootstrap to estimate covariance of all temps' PP point estimates -----
-        bootidx_bxn = np.random.choice(n_cal, size=(n_bootstrap, n_cal), replace=True)
-        thetahatboot_txb = np.zeros([len(temperatures), n_bootstrap])
-        for b, bootidx_n in enumerate(bootidx_bxn):
-            caldrboot_txn = caldr_txn[:, bootidx_n]
-            if self_normalize_weights:
-                caldrboot_txn = n_cal * caldrboot_txn / np.sum(caldrboot_txn, axis=1)
-            rectboot_txn = caldrboot_txn * (ycal_n - predcal_n)[None, :]
-            thetahatboot_txb[:, b] = imputed_mean_se_tx2[:, 0] + np.mean(rectboot_txn, axis=1)
-
-        # ----- simulate max-t statistics -----
-        Sigmahat_txt = np.cov(thetahatboot_txb)
-        z_xt = sc.stats.multivariate_normal.rvs(mean=None, cov=Sigmahat_txt, size=100000)
-        sigmahat_t = np.sqrt(np.diag(Sigmahat_txt))
-        maxt_ = np.max(z_xt / sigmahat_t[None, :], axis=1)
-
-        # ----- compute prediction-powered max-t p-values -----
-        for target_val in target_values:
-            score_t = (thetahat_t - target_val) / sigmahat_t
-            cdf_t = np.mean(score_t[:, None] >= maxt_[None, :], axis=1)
-            p_t = 1 - cdf_t
-
-            for t, temp in enumerate(temperatures):
-                df.loc[target_val]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = p_t[t]
-        
-        # ----- print and save progress -----
-        print(f'Done with {i + 1} / {n_trial} trials ({int(time() - t0)} s).')
-        if results_csv_fname is not None:
-            df.to_csv(results_fname) # time sink
-            print('Saved to {} ({} s).\n'.format(results_fname, int(time() - t0)))
-
-    return df

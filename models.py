@@ -318,6 +318,12 @@ class TorchRegressorEnsemble(torch.nn.Module):
         tohe_nxlxa = torch.from_numpy(ohe_nxlxa).to(device=self.device, dtype=self.dtype)
         return self(tohe_nxlxa).cpu().detach().numpy()
     
+    def ensemble_predict(self, seq_n, verbose: bool = False):
+        ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
+        tohe_nxlxa = torch.from_numpy(ohe_nxlxa).to(device=self.device, dtype=self.dtype)
+        tpred_nxm = torch.cat([model(tohe_nxlxa) for model in self.models], dim=1)
+        return tpred_nxm.cpu().detach().numpy()
+    
     def predict_prob_exceedance(self, seq_n, threshold: float, verbose: bool = False):
         ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
         tohe_nxlxa = torch.from_numpy(ohe_nxlxa).to(device=self.device, dtype=self.dtype)
