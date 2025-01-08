@@ -34,9 +34,11 @@ class MultiMDRE():
 
     def fit(
             self,
+            design_names,
             name2designdata,
             noise_sd: float = 0.,
             lr: float = 1e-3,
+            quadratic_final_layer: bool = False,
             weight_loss: bool = True,
             weight_decay: float = 0.,
             seq_len: int = 50,
@@ -52,7 +54,7 @@ class MultiMDRE():
 
         # assign each design algorithm to its group
         for name, data in name2designdata.items():
-            if name != 'train':
+            if name != 'train' and name in design_names:
                 group_idx = self._name2idx(name)
                 assert(name not in idx2group[group_idx])
                 idx2group[group_idx][name] = data
@@ -76,6 +78,7 @@ class MultiMDRE():
                 seq_len=seq_len,
                 n_distribution=len(name2dd),
                 n_hidden=n_hidden,
+                quadratic_final_layer=quadratic_final_layer,
                 device=self.device,
             )
             loss_df = mdre.fit(
@@ -99,6 +102,7 @@ class MultiMDRE():
     def get_dr(
             self,
             calseq_n,
+            # calpred_n,
             design_name: str,
             self_normalize: bool = True,
             verbose: bool = False
@@ -167,7 +171,8 @@ class MultiInputNN(nn.Module):
         # layers for the combined input
         self.combined_fc1 = nn.Linear(n_hidden + 1, n_hidden)
         self.dropout2 = nn.Dropout(p=0.5)
-        self.output_fc = nn.Linear(n_hidden, n_distribution)
+        # self.output_fc = nn.Linear(n_hidden, n_distribution)
+        self.output_fc = QuadraticLayer(n_hidden + 1, n_distribution)
 
     def forward(self, X_nxlxa, x_nx1):
         # Forward pass for the first input
@@ -182,9 +187,10 @@ class MultiInputNN(nn.Module):
         cat_nxh1 = torch.cat((X_nxh, x_nx1), dim=1)
         
         # Forward pass for the combined inputs
-        combined = F.relu(self.combined_fc1(cat_nxh1))
-        combined = self.dropout2(combined)
-        output = self.output_fc(combined)
+        # combined = F.relu(self.combined_fc1(cat_nxh1))
+        # combined = self.dropout2(combined)
+        # output = self.output_fc(combined)
+        output = self.output_fc(cat_nxh1)
         
         return output
     
@@ -195,24 +201,33 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
             seq_len: int,
             n_distribution: int,  # including train distribution
             n_hidden: int,
+            quadratic_final_layer: bool = False,
             alphabet: str = RNA_NUCLEOTIDES,
             device = None,
             dtype = torch.float,
         ):
         super().__init__()
 
-        # self.model = nn.Sequential(
-        #     nn.Flatten(),
-        #     nn.Linear(seq_len * len(alphabet), n_hidden),
-        #     nn.ReLU(),
-        #     nn.Dropout(p=0.5),
-        #     # nn.Linear(n_hidden, n_hidden),
-        #     # nn.ReLU(),
-        #     # nn.Dropout(p=0.5),
-        #     # nn.Linear(n_hidden, n_distribution),
-        #     QuadraticLayer(n_hidden, n_distribution)
-        # )
-        self.model = MultiInputNN(seq_len, len(alphabet), n_hidden, n_distribution)
+        if quadratic_final_layer: 
+            self.model = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(seq_len * len(alphabet), n_hidden),
+                nn.ReLU(),
+                nn.Dropout(p=0.5),
+                QuadraticLayer(n_hidden, n_distribution)
+            )
+        else:
+            self.model = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(seq_len * len(alphabet), n_hidden),
+                nn.ReLU(),
+                nn.Dropout(p=0.5),
+                nn.Linear(n_hidden, n_hidden),
+                nn.ReLU(),
+                nn.Dropout(p=0.5),
+                nn.Linear(n_hidden, n_distribution),
+            )
+        # self.model = MultiInputNN(seq_len, len(alphabet), n_hidden, n_distribution)
         self.model.to(device=device, dtype=dtype)
         self.Xmean_lxa = None
         self.Xstd_lxa = None
@@ -253,51 +268,65 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
         # `self.designname2idx[name]` gives the index i such that
         # tX_nxlxa_m[i] gives the sequence representations corresponding to `name`.
         tX_nxlxa_m = []
+        # tpred_nx1_m = []
         if verbose:
             print('One-hot-encoding all {} categories of sequences...'.format(self.n_distribution))
+
         t0 = time()
         for name in names:
-            X_nxlxa = type_check_and_one_hot_encode_sequences(designname2data[name][0], self.alphabet)
+            seq_n = designname2data[name][0]
+            X_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet)
 
             # randomly shuffle sequences
-            X_nxlxa = X_nxlxa[np.random.permutation(X_nxlxa.shape[0])]  
+            shuffle_idx = np.random.permutation(len(seq_n))
+            X_nxlxa = X_nxlxa[shuffle_idx]
+            # pred_n = pred_n[shuffle_idx]
 
             # add Gaussian noise
             X_nxlxa += norm.rvs(loc=0, scale=noise_sd, size=X_nxlxa.shape)
 
             # convert to tensors
             tX_nxlxa_m.append(torch.from_numpy(X_nxlxa).to(device=self.device, dtype=self.dtype))
+            # tpred_nx1_m.append(torch.from_numpy(pred_n[:, None]).to(device=self.device, dtype=self.dtype))
         if verbose:
             print('  Done. ({} s)'.format(int(time() - t0)))
         
         if val_frac > 0:
             Xtr_nxd_m = []
+            predtr_nx1_m = []
             ztr_n_m = []  # categorical labels for the different design distributions
             Xval_nxd_m = []
+            predval_nx1_m = []
             zval_n_m = []
             for k, X_nxlxa in enumerate(tX_nxlxa_m):
                 n = X_nxlxa.shape[0]
                 n_val = int(val_frac * n)
 
                 Xtr_nxd_m.append(X_nxlxa[n_val :])
+                # predtr_nx1_m.append(pred_nx1[n_val :])
                 ztr_n_m.append(
                     k * torch.ones((X_nxlxa[n_val :].shape[0]), device=self.device, dtype=torch.int64)
                 )
 
                 Xval_nxd_m.append(X_nxlxa[: n_val])
+                # predval_nx1_m.append(pred_nx1[: n_val])
                 zval_n_m.append(
                     k * torch.ones((X_nxlxa[: n_val].shape[0]), device=self.device, dtype=torch.int64)
                 )
             
             Xtr_mnxd = torch.cat(Xtr_nxd_m, dim=0)
+            # predtr_mnx1 = torch.cat(predtr_nx1_m, dim=0)
             ztr_mn = torch.cat(ztr_n_m, dim=0)
 
             # for input feature normalization
             # d is shorthand for lxa
             self.Xmean_lxa = Xtr_mnxd.mean(dim=0)
             self.Xstd_lxa = Xtr_mnxd.std(dim=0)
+            # self.predmean = predtr_mnx1.mean()
+            # self.predstd = predtr_mnx1.std()
 
             Xval_mnxd = torch.cat(Xval_nxd_m, dim=0)
+            # predval_mnx1 = torch.cat(predval_nx1_m)
             zval_mn = torch.cat(zval_n_m, dim=0)
 
             if weight_loss:
@@ -354,12 +383,12 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
             if val_frac > 0:
                 with torch.no_grad():
                     self.model.eval()
-                    vallogits = self.model(Xval_mnxd)
+                    vallogits = self.model(Xval_mnxd) # , predval_mnx1)
                     val_loss = val_loss_fn(vallogits, zval_mn)
                     self.model.train()
 
             self.model.zero_grad()
-            trlogits = self.model(Xtr_mnxd)
+            trlogits = self.model(Xtr_mnxd) # , predtr_mnx1)
             train_loss = tr_loss_fn(trlogits, ztr_mn)
 
             if val_frac > 0 and val_loss < best_loss:
@@ -384,13 +413,15 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
 
     def forward(self, tX_nxlxa: torch.Tensor):
         tX_nxlxa = (tX_nxlxa - self.Xmean_lxa) / self.Xstd_lxa
-        return self.model(tX_nxlxa)
+        # tpred_nx1 = (tpred_nx1 - self.predmean) / self.predstd
+        return self.model(tX_nxlxa) # , tpred_nx1)
 
     def get_dr(self, seq_n: np.array, self_normalize: bool = True):
         X_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet)
         tX_nxlxa = torch.from_numpy(X_nxlxa).to(device=self.device, dtype=self.dtype)
+        # tpred_nx1 = torch.from_numpy(pred_n[:, None]).to(device=self.device, dtype=self.dtype)
 
-        th_nxm = self(tX_nxlxa)
+        th_nxm = self(tX_nxlxa) # , tpred_nx1)
         # train distribution is category 0
         ldr_nxm = (th_nxm[:, 1 :] - th_nxm[:, 0][:, None]).cpu().detach().numpy()
     

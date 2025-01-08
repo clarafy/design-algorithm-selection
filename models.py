@@ -180,12 +180,17 @@ class EnrichmentFeedForward(torch.nn.Module):
         self.load_state_dict(best_model_parameters)
         self.requires_grad_(False)
         return loss_tx2
-
-    def predict(self, seq_n, verbose: bool = False):
+    
+    def ensemble_predict(self, seq_n, verbose: bool = False):
         ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
         tohe_nxlxa = torch.from_numpy(ohe_nxlxa).to(device=self.device, dtype=self.dtype)
         tohe_nxla = torch.flatten(tohe_nxlxa, start_dim=1)
-        return self(tohe_nxla).cpu().detach().numpy()
+        pred_nxm = torch.cat([model(tohe_nxla) for model in self.models], dim=1)
+        return pred_nxm.cpu().detach().numpy()
+
+    def predict(self, seq_n, verbose: bool = False):
+        pred_nxm = self.ensemble_predict(seq_n, verbose=verbose)
+        return np.mean(pred_nxm, axis=1, keepdims=False)
     
     def save(self, save_fname_no_ftype, save_path: str = '/data/wongfanc/gb1-models'):
         Path(save_path).mkdir(parents=True, exist_ok=True)
@@ -401,6 +406,175 @@ class CNN(TorchRegressorEnsemble):
             )
         for _ in range(n_model)])
         super().__init__(models, seq_len, alphabet, device=device, dtype=dtype)
+
+
+class TorchClassifierEnsemble(torch.nn.Module):
+    def __init__(
+        self,
+        models,
+        exceedance_threshold: float,
+        seq_len: int,
+        alphabet: str,
+        device = None,
+        dtype = torch.float
+    ):
+        super().__init__()
+        
+        self.models = models
+        self.models.to(device, dtype=dtype)
+
+        self.device = device
+        self.dtype = dtype
+
+        self.exceedance_threshold = exceedance_threshold
+        self.seq_len = seq_len
+        self.alphabet = alphabet
+        self.input_sz = seq_len * len(alphabet)
+
+    def forward(self, tX_nxlxa):
+        pred_nxm = torch.cat([model(tX_nxlxa) for model in self.models], dim=1)
+        return torch.mean(pred_nxm, dim=1, keepdim=False)
+    
+    def weighted_bce_loss(self, logit_b, y_b, weight_b):
+        return torch.nn.functional.binary_cross_entropy_with_logits(logit_b, y_b, weight=weight_b)
+    
+    def fit(
+        self,
+        seq_n,
+        y_n: np.array,
+        batch_size: int = 64,
+        n_epoch: int = 5,
+        lr: float = 0.001,
+        val_frac: float = 0.1,
+        n_data_workers: int = 1
+    ):
+        if val_frac < 0:
+            raise ValueError('val_frac = {} must be positive.'.format(val_frac))
+
+        ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=True)
+        y_n = (y_n >= self.exceedance_threshold).astype(float)
+        dataset = [(ohe_lxa, y) for ohe_lxa, y in zip(ohe_nxlxa, y_n)]
+
+        # split into training and validation
+        
+        good_split = False
+        while not good_split:
+            shuffle_idx = np.random.permutation(len(dataset))
+            n_val = int(val_frac * len(dataset))
+            n_train = len(dataset) - n_val
+            val_dataset = [dataset[i] for i in shuffle_idx[n_train :]]
+            assert(len(val_dataset) == n_val)
+            val_n1 = np.sum([y for _, y in val_dataset])
+            if val_n1 >= 5:
+                good_split = True
+
+            val_n0 = n_val - val_n1
+            val_w1 = n_val / (2 * val_n1)
+            val_w0 = n_val / (2 * val_n0)
+            val_dataset = [(ohe, y, val_w1 if y == 1 else val_w0) for ohe, y in val_dataset]
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=n_data_workers)
+                
+            train_dataset = [dataset[i] for i in shuffle_idx[: n_train]]
+            train_n1 = np.sum([y for _, y in train_dataset])
+            train_n0 = n_train - train_n1
+            train_w1 = n_train / (2 * train_n1)
+            train_w0 = n_train / (2 * train_n0)
+            train_dataset = [(ohe, y, train_w1 if y == 1 else train_w0) for ohe, y in train_dataset]
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_data_workers)
+        print('{} training data points with {} positive, {} validation data points with {} positive.'.format(
+            n_train, train_n1, n_val, val_n1
+        ))
+        
+        optimizer = torch.optim.Adam(self.models.parameters(), lr=lr)
+        loss_tx2 = np.zeros([n_epoch, 2])
+        best_val_loss = np.inf
+        best_model_parameters = None
+        for t in range(n_epoch):
+            
+            t0 = time()
+
+            # validation loss
+            self.requires_grad_(False)
+            total_val_loss = 0.
+            for _, data in enumerate(tqdm(val_loader)):
+                tX_bxlxa, tymean_b, tw_b = data
+                tX_bxlxa = tX_bxlxa.to(device=self.device, dtype=self.dtype)
+                tymean_b = tymean_b.to(device=self.device, dtype=self.dtype)
+                tw_b = tw_b.to(device=self.device, dtype=self.dtype)
+
+                logit_b = self(tX_bxlxa)
+                loss = self.weighted_bce_loss(logit_b, tymean_b, tw_b)
+                total_val_loss += loss.item() * tX_bxlxa.shape[0]
+            total_val_loss /= n_val
+
+            if total_val_loss < best_val_loss:
+                best_val_loss = total_val_loss
+                best_model_parameters = copy.deepcopy(self.state_dict())
+
+            # gradient step on training loss
+            self.requires_grad_(True)
+            total_train_loss = 0.
+            for _, data in enumerate(tqdm(train_loader)):
+                tX_bxlxa, tymean_b, tw_b = data
+                tX_bxlxa = tX_bxlxa.to(device=self.device, dtype=self.dtype)
+                tymean_b = tymean_b.to(device=self.device, dtype=self.dtype)
+                tw_b = tw_b.to(device=self.device, dtype=self.dtype)
+
+                optimizer.zero_grad()
+
+                logit_b = self(tX_bxlxa)
+
+                loss = self.weighted_bce_loss(logit_b, tymean_b, tw_b)
+                loss.backward()
+
+                optimizer.step()
+                total_train_loss += loss.item() * tX_bxlxa.shape[0]
+
+            total_train_loss /= n_train
+            loss_tx2[t] = total_train_loss, total_val_loss
+            print('Epoch {}. Train loss: {:.2f}. Val loss: {:.2f}. {} sec.'.format(t, total_train_loss, total_val_loss, int(time() - t0)))
+        
+        self.load_state_dict(best_model_parameters)
+        self.requires_grad_(False)
+        return loss_tx2
+    
+    def predict(self, seq_n, verbose: bool = False):
+        ohe_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet, verbose=verbose)
+        tohe_nxlxa = torch.from_numpy(ohe_nxlxa).to(device=self.device, dtype=self.dtype)
+        tlogit_n = self(tohe_nxlxa)
+        tpred_n = torch.sigmoid(tlogit_n)
+        return tpred_n.cpu().detach().numpy()
+    
+    def save(self, save_fname):
+        torch.save(self.state_dict(), save_fname)
+        print('Saved models to {}.'.format(save_fname))
+    
+    def load(self, save_fname):
+        self.load_state_dict(torch.load(save_fname))
+
+
+class FeedForwardClassifier(TorchClassifierEnsemble):
+    def __init__(
+        self,
+        exceedance_threshold: float,
+        seq_len: int,
+        alphabet: str,
+        n_hidden: int,
+        n_model: int = 3,
+        device = None,
+        dtype = torch.float
+    ):
+        models = nn.ModuleList([
+            nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(seq_len * len(alphabet), n_hidden),
+                nn.ReLU(), 
+                nn.Linear(n_hidden, n_hidden),
+                nn.ReLU(),
+                nn.Linear(n_hidden, 1),
+            )
+        for _ in range(n_model)])
+        super().__init__(models, exceedance_threshold, seq_len, alphabet, device=device, dtype=dtype)
 
 
 class SklearnRegressor():
