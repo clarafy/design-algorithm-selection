@@ -539,6 +539,8 @@ def process_gb1_cp_selection_experiments(
     target_values = [round(val, 4) for val in target_values]
     temperatures = [round(temp, 4) for temp in temperatures]
     val2selected = {val: [] for val in target_values}
+
+    # for each target value, collect the selected temperatures for that desired value
     for i in range(n_trial):
         for val in target_values:
             val2selected[val].append([])
@@ -547,7 +549,7 @@ def process_gb1_cp_selection_experiments(
             forecast = df.loc[i]['qc_forecast_mean_temp{:.4f}'.format(temp)]  # cp_nobonf_lb_
 
             for val in target_values:
-                if val <= forecast:
+                if forecast >= val:
                     val2selected[val][i].append(temp)
 
     worst_v = []

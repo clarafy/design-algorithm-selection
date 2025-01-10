@@ -43,9 +43,9 @@ class ExceedancePredictor():
         self.lr = LogisticRegression(class_weight=None, warm_start=False, penalty=None)
         self.lr_fitted = False
 
-    def fit(self, ohe_nxlxa: np.array, binary_y_n: np.array):
+    def fit(self, ohe_nxlxa: np.array, binary_y_n: np.array, weight_n=None):
         pred_n = self.model.predict(ohe_nxlxa)
-        self.lr.fit(pred_n[:, None], binary_y_n)
+        self.lr.fit(pred_n[:, None], binary_y_n, sample_weight=weight_n)
         self.lr_fitted = True
 
     def predict(self, ohe_nxlxa: np.array):
