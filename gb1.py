@@ -647,44 +647,42 @@ def select_for_mean_with_calibration_data(
     return df, forecast_csv_fname
 
 
-def run_imputation_exceedance_selection_experiments(  # HERE
+def select_for_exceedance_no_calibration_data(
     model: EnrichmentFeedForward,
     temp2theta,
     target_values: np.array,
     n_trial: int,
     trainseq_n,
     ytrain_n: np.array,
-    wheelock_forecast_qs,
+    gmm_forecast_qs,
     exceedance_threshold: float = None,
     n_design: int = 1000000,
     save_path: str = '/data/wongfanc/gb1-results',
     imp_csv_fname: str = None,
-    n_wheelock_designs: int = 100000,
-    wheelock_csv_fname: str = None,
+    n_gmm_designs: int = 100000,
+    gmm_csv_fname: str = None,
     design_samples_fname_prefix: str = None,
     load_design_samples: bool = False,
     save_design_samples: bool = False
 ):
     
     if imp_csv_fname is not None:
-        assert(wheelock_csv_fname is not None)
-    if wheelock_csv_fname is not None:
+        assert(gmm_csv_fname is not None)
+    if gmm_csv_fname is not None:
         assert(imp_csv_fname is not None)
         
     temperatures = [round(t, 4) for t in list(temp2theta.keys())]
     target_values = np.array([round(v, 4) for v in target_values])
     imp_selected_column_names = ['tr{}_imp_pval_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
-    df = DataFrame(
-        index=target_values, columns=imp_selected_column_names
-    )
+    df = DataFrame(index=target_values, columns=imp_selected_column_names)
 
-    # dataframe for Wheelock forecasting results
-    wf_column_names = ['wf_mean_q{:.2f}_temp{:.4f}'.format(q, temp) for q in wheelock_forecast_qs for temp in temperatures]
-    wf_cs_column_names = ['wf_mean_q{:.2f}_cs_temp{:.4f}'.format(q, temp) for q in wheelock_forecast_qs for temp in temperatures]
-    wf_df = DataFrame(index=range(n_trial), columns=wf_column_names + wf_cs_column_names)
+    # dataframe for GMM forecast results
+    gmm_column_names = ['wf_mean_q{:.2f}_temp{:.4f}'.format(q, temp) for q in gmm_forecast_qs for temp in temperatures]
+    gmm_cs_column_names = ['wf_mean_q{:.2f}_cs_temp{:.4f}'.format(q, temp) for q in gmm_forecast_qs for temp in temperatures]
+    gmm_df = DataFrame(index=range(n_trial), columns=gmm_column_names + gmm_cs_column_names)
 
-    # predictions on training data and edit distance from WT for Wheelock forecasts
-    predtrain_n = model.predict(trainseq_n)
+    # (real-valued) predictions and edit distance from WT for training sequences, for GMM forecasts
+    realpredtrain_nxm = model.ensemble_predict(trainseq_n)
     trained_n = np.array([editdistance.eval(WT_GB1, seq) for seq in trainseq_n])
 
     if load_design_samples and save_design_samples:
@@ -693,17 +691,12 @@ def run_imputation_exceedance_selection_experiments(  # HERE
         if design_samples_fname_prefix is None:
             raise ValueError('Provide design_samples_fname_prefix.')
         
-    if exceedance_threshold is not None:
-        print('Selection quantity is probability of exceeding {}.'.format(exceedance_threshold))
-        predictor = ExceedancePredictor(model, exceedance_threshold)
-        # seq2y = {seq: (SEQ2YVAR[seq][0] >= exceedance_threshold).astype(float) for seq in SEQ2YVAR.keys()}
-    else:
-        print('Selection quantity is the mean label.')
-        predictor = model
-        # seq2y = SEQ2YVAR
-    # print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(np.min(target_values), np.max(target_values)))
+    print('Selection quantity is probability of exceeding {}.'.format(exceedance_threshold))
+    print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(
+        np.min(target_values), np.max(target_values)
+    ))
 
-    
+    predictor = ExceedancePredictor(model, exceedance_threshold)
     t0 = time() 
     for t, (temp, theta_lxa) in enumerate(temp2theta.items()):
 
@@ -711,15 +704,19 @@ def run_imputation_exceedance_selection_experiments(  # HERE
 
             # sampling design sequences is the bottleneck for computation
             if load_design_samples:
+
                 design_samples_fname = os.path.join(save_path, '{}-t{:.4f}-{}.npz'.format(design_samples_fname_prefix, temp, i))
                 d = np.load(design_samples_fname)
+
                 designohe_nxlxa = d['designohe_nxlxa']
                 designed_n = d['designed_n']
+
                 if designohe_nxlxa.shape[0] != n_design:
                     raise ValueError('Loaded {} != n_design = {} design sequences from {}.'.format(
                         designohe_nxlxa.shape[0], n_design, design_samples_fname
                     ))
                 print('Loaded {} design sequences from {}.'.format(n_design, design_samples_fname))
+
             else:
                 # sample unlabeled sequences from design distribution
                 _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
@@ -733,8 +730,9 @@ def run_imputation_exceedance_selection_experiments(  # HERE
                     np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
                     print('Saved design samples to {}.'.format(design_samples_fname))
                 
-            # predictions for unlabeled design sequences
-            preddesign_n = predictor.predict(designohe_nxlxa)
+            # predictions for unlabeled design sequences 
+            realpreddesign_nxm = model.ensemble_predict(designohe_nxlxa)  # real-valued, for GMM
+            preddesign_n = predictor.predict(designohe_nxlxa)         # binary-valued, for PO
             imputed_mean = np.mean(preddesign_n)
             imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
 
@@ -748,25 +746,33 @@ def run_imputation_exceedance_selection_experiments(  # HERE
                 )[1]
                 df.loc[target_val]['tr{}_imp_pval_temp{:.4f}'.format(i, temp)] = imp_pval
             
-            # ===== Wheelock forecast ===== 
+            # ===== GMM forecast ===== 
             # subsample to avoid OOM
-            samp_idx = np.random.choice(preddesign_n.size, size=(n_wheelock_designs), replace=False)
-            designp_N, designped_N, q2functionalmus, designmuneg_N = wheelock_mean_forecast(
-                ytrain_n, predtrain_n, trained_n, preddesign_n[samp_idx], designed_n[samp_idx], qs=wheelock_forecast_qs
+            samp_idx = np.random.choice(preddesign_n.size, size=(n_gmm_designs), replace=False)
+            
+            designp_N, designped_N, q2functionalmus, designmuneg_N, designsig2plus_N, designsig2neg_N = utils.wheelock_forecast(
+                ytrain_n, realpredtrain_nxm, trained_n, realpreddesign_nxm[samp_idx], designed_n[samp_idx], qs=gmm_forecast_qs
             )
+            designsigplus_N = np.sqrt(designsig2plus_N)
+            designsigneg_N = np.sqrt(designsig2neg_N)
 
-            # record forecast
+            # get exceedance estimates based on GMM forecasts, for different values of q ("semi-calibration")
             for q, (designmutilde_N, designmued_N) in q2functionalmus.items():
-                # w/o correction for covariate shift
-                forecast_tilde = np.mean(designp_N * designmutilde_N + (1 - designp_N) * designmuneg_N)
-                wf_df.loc[i]['wf_mean_q{:.2f}_temp{:.4f}'.format(q, temp)] = forecast_tilde
 
-                # w/ correction to p and \tilde{\mu} for covariate shift,
-                # based on edit distance to the seed sequence
-                forecast_ed = np.mean(designped_N * designmued_N + (1 - designped_N) * designmuneg_N)
-                wf_df.loc[i]['wf_mean_q{:.2f}_cs_temp{:.4f}'.format(q, temp)] = forecast_ed
-                print('Temp {:.4f}, trial {}, q = {}. Wheelock forecast {:.3f}, w/ covariate shift {:.3f}'.format(
-                    temp, i, q, forecast_tilde, forecast_ed
+                exceedance_tilde, exceedance_ed =  utils.get_exceedance_from_gmm_forecasts(
+                    exceedance_threshold,
+                    designp_N,
+                    designped_N,
+                    designmued_N,
+                    designmutilde_N,
+                    designmuneg_N,
+                    designsigplus_N,
+                    designsigneg_N
+                )
+                gmm_df.loc[i]['wf_mean_q{:.2f}_temp{:.4f}'.format(q, temp)] = exceedance_tilde
+                gmm_df.loc[i]['wf_mean_q{:.2f}_cs_temp{:.4f}'.format(q, temp)] = exceedance_ed
+                print('Temp {:.4f}, trial {}, q = {}. GMM forecast {:.3f}, w/ covariate shift {:.3f}'.format(
+                    temp, i, q, exceedance_tilde, exceedance_ed
                 ))
         
         print('Done with temperature {:.4f} ({} / {}) ({} s)'.format(
@@ -774,13 +780,13 @@ def run_imputation_exceedance_selection_experiments(  # HERE
         )
         if imp_csv_fname is not None:
             df.to_csv(imp_csv_fname)
-            wf_df.to_csv(wheelock_csv_fname, index_label='trial')
-            print('Saved to {} and {} ({} s).'.format(imp_csv_fname, wheelock_csv_fname, int(time() - t0)))
+            gmm_df.to_csv(gmm_csv_fname, index_label='trial')
+            print('Saved to {} and {} ({} s).'.format(imp_csv_fname, gmm_csv_fname, int(time() - t0)))
     
     return df
 
 
-def run_selection_for_exceedance_with_calibration_data(
+def select_for_exceedance_with_calibration_data(
     model: EnrichmentFeedForward,
     temp2theta,
     target_values: np.array,
@@ -788,14 +794,13 @@ def run_selection_for_exceedance_with_calibration_data(
     n_cal: int = 5000,
     n_design: int = 1000000,
     n_trial: int = 200,
-    # n_forecast_designs: int = 1000,
-    # tol: float = 0.01,
-    # quad_limit: int = 500,
-    n_train_lr: int = 500,
+    n_design_subsample: int = 1000,
+    weight_isonotic_regression: bool = False,
+    n_train_lr: int = 1000,
     self_normalize_weights: bool = True,
     save_path: str = '/data/wongfanc/gb1-results',
     pp_csv_fname: str = None,
-    # forecast_csv_fname: str = None,
+    forecast_csv_fname: str = None,
     design_samples_fname_prefix: str = None,
     load_design_samples: bool = False,
     save_design_samples: bool = False
@@ -803,15 +808,16 @@ def run_selection_for_exceedance_with_calibration_data(
     
     temperatures = [round(t, 4) for t in temp2theta.keys()]
     target_values = np.array([round(v, 4) for v in target_values])
+
     pp_selected_column_names = ['tr{}_pp_pval_temp{:.4f}'.format(i, temp) for i in range(n_trial) for temp in temperatures]
+    df = DataFrame(index=target_values, columns=pp_selected_column_names)
     forecast_column_names = ['cp_lb_temp{:.4f}'.format(temp) for temp in temperatures] \
         + ['cp_nobonf_lb_temp{:.4f}'.format(temp) for temp in temperatures] \
         + ['qc_forecast_mean_temp{:.4f}'.format(temp) for temp in temperatures]
-    df = DataFrame(index=target_values, columns=pp_selected_column_names)
     forecast_df = DataFrame(index=range(n_trial), columns=forecast_column_names)
 
-    # if pp_csv_fname is not None:
-    #     assert(forecast_df is not None)
+    if pp_csv_fname is not None:
+        assert(forecast_csv_fname is not None)
 
     if load_design_samples and save_design_samples:
         raise ValueError('Only one of load_design_samples or save_design_samples can be True.') 
@@ -845,16 +851,6 @@ def run_selection_for_exceedance_with_calibration_data(
                 design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
                 np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
                 print('Saved design samples to {}.'.format(design_samples_fname))
-            
-
-        # ----- predictions for designs -----
-        # preddesign_Nxm = predictor.ensemble_predict(designohe_nxlxa)
-        # preddesign_N = np.mean(preddesign_Nxm, axis=1)
-        # forecast_idx = np.random.choice(preddesign_N.size, size=n_forecast_designs, replace=False)
-        # designmu_n = preddesign_N[forecast_idx]
-        # designsigma_n = np.std(preddesign_Nxm[forecast_idx, :], axis=1, keepdims=False)
-        # pos_int_limit = 2 * np.max(designmu_n + 3 * designsigma_n)
-        # neg_int_limit = 2 * np.min(designmu_n - 3 * designsigma_n)
 
 
         # ----- get density ratio weights for N designs (for CP baseline) -----
@@ -874,40 +870,80 @@ def run_selection_for_exceedance_with_calibration_data(
             _, calohe_nxlxa, calseq_n = sample_ohe_from_nuc_distribution(
                 PNUC_NNK_LXA, n_cal, normalize=False, reject_stop_codon=True
             )
-            ycal_n = np.array([SEQ2YVAR[seq][0] for seq in calseq_n])
-            ycal_n = (ycal_n >= exceedance_threshold).astype(float)
+            # get real-valued labels for calibration sequences
+            realycal_n = np.array([SEQ2YVAR[seq][0] for seq in calseq_n])
 
-            # ----- train exceedance predictor for this trial -----
+
+            # ===== marginally calibrated forecasts (do this first before splitting cal data for PP)=====
+
+            # real-valued predictions for calibration sequences
+            realpredcal_nxm = model.ensemble_predict(calohe_nxlxa)
+            realpredcal_n = np.mean(realpredcal_nxm, axis=1, keepdims=False)
+            
+            # fit isotonic regression to calibrate forecasts
+            calsigma_n = np.std(realpredcal_nxm, axis=1, keepdims=False)
+            calF_n = sc.stats.norm.cdf(realycal_n, loc=realpredcal_n, scale=calsigma_n)
+            calempF_n = np.mean(calF_n[:, None] <= calF_n[None, :], axis=0, keepdims=False)
+            ir = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
+            ir.fit(calF_n, calempF_n, sample_weight=caldr_n if weight_isonotic_regression else None)
+
+            # subsample designs for CP and marginally calibrated forecasts, for speed
+            sample_idx = np.random.choice(n_design, size=n_design_subsample, replace=False)
+
+            # real-valued predictions for design sequences
+            realpreddesign_nxm = model.ensemble_predict(designohe_nxlxa[sample_idx])
+            designmu_n = np.mean(realpreddesign_nxm, axis=1, keepdims=False)
+            designsigma_n = np.std(realpreddesign_nxm, axis=1, keepdims=False)
+
+            # get exceedance from calibrated forecasts
+            F_n = sc.stats.norm.cdf(exceedance_threshold, loc=designmu_n, scale=designsigma_n)
+            calibratedF_n = ir.predict(F_n)
+            calibrated_exceedance = np.mean(1 - calibratedF_n)  # SF = 1 - CDF and tower property
+            forecast_df.loc[i, 'qc_forecast_mean_temp{:.4f}'.format(temp)] = calibrated_exceedance
+
+
+            # ===== CP =====
+            # CP-based lower bound
+            # lb, lb_nobonf = get_conformal_prediction_lower_bound(
+            #     ycal_n, predcal_n, caldr_n, preddesign_N, designdr_N,
+            #     alpha=alpha / len(temperatures), batch_sz=cp_batch_sz
+            # )
+            # # conformal prediction-based test outcomes (reject/fail to reject)
+            # cp_df.loc[i, 'cp_lb_temp{:.4f}'.format(temp)] = lb
+            # cp_df.loc[i, 'cp_nobonf_lb_temp{:.4f}'.format(temp)] = lb_nobonf
+            # if lb_nobonf > -np.inf:
+            #     print('Temp {:.4f}, trial {} has CP-based LBs {:.4f} (Bonferroni), {:.4f} (uncorrected) ({} s)'.format(
+            #         temp, i, lb, lb_nobonf, int(time() - t0)
+            #     ))
+
+
+            # ===== PP =====
+
+            # binarize labels
+            ycal_n = (realycal_n >= exceedance_threshold).astype(float)
+
+            # ----- train [0, 1] exceedance predictor for this trial -----
             predictor = ExceedancePredictor(model, exceedance_threshold)
             sampled_both_labels = False
+            # ensure enough positive labels in both training and calibration data
             while not sampled_both_labels:  
                 shuffle_idx = np.random.permutation(n_cal)
                 train_idx, cal_idx = shuffle_idx[: n_train_lr], shuffle_idx[n_train_lr :]
-                sampled_both_labels = any(ycal_n[train_idx]) and any(ycal_n[cal_idx])
-
-            trainohe_nxlxa = calohe_nxlxa[train_idx]
-            ytrain_n = ycal_n[train_idx]
-            # n1 = np.sum(ytrain_n)
-            # n0 = n_train_lr - n1
-            # w1 = n_train_lr / (2 * n1)
-            # w0 = n_train_lr / (2 * n0)
-            # w_n = [w1 if y == 1 else w0 for y in ytrain_n]
-            # assert(np.abs(np.sum(w_n) - n_train_lr) < 1e-6)
-            predictor.fit(trainohe_nxlxa, ytrain_n)  # , weight_n=w_n)
+                sampled_both_labels = np.sum(ycal_n[train_idx]) > 2 and np.sum(ycal_n[cal_idx]) > 2
+            trainohe_nxlxa, ytrain_n = calohe_nxlxa[train_idx], ycal_n[train_idx]
+            predictor.fit(trainohe_nxlxa, ytrain_n)
 
             # use the remaining data for calibration
             calohe_nxlxa = calohe_nxlxa[cal_idx]
             ycal_n = ycal_n[cal_idx]
 
-            # ----- predictions -----
+            # ----- [0, 1] predictions -----
             # for design sequences
             preddesign_n = predictor.predict(designohe_nxlxa)
             imputed_mean = np.mean(preddesign_n)
             imputed_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
 
             # for calibration sequences
-            # predcal_nxm = predictor.ensemble_predict(calohe_nxlxa)
-            # predcal_n = np.mean(predcal_nxm, axis=1, keepdims=False)
             predcal_n = predictor.predict(calohe_nxlxa)
 
             # ----- compute rectifier -----
@@ -923,7 +959,7 @@ def run_selection_for_exceedance_with_calibration_data(
             rectifier_mean = np.mean(rect_n)
             rectifier_se = np.std(rect_n) / np.sqrt(rect_n.size)
 
-            # get prediction-powered p-values for each desired threshold value
+            # PP p-values
             for target_val in target_values:
                 pp_pval = rectified_p_value(
                     rectifier_mean,
@@ -935,52 +971,14 @@ def run_selection_for_exceedance_with_calibration_data(
                 )
                 df.loc[target_val]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
 
-            # ----- quantile-calibrated forecasts -----
-            # calsigma_n = np.std(predcal_nxm, axis=1, keepdims=False)
-            # calF_n = sc.stats.norm.cdf(ycal_n, loc=predcal_n, scale=calsigma_n)
-            # calempF_n = np.mean(calF_n[:, None] <= calF_n[None, :], axis=0, keepdims=False)
-            # ir = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
-            # ir.fit(calF_n, calempF_n, sample_weight=caldr_n)
-
-            # # subsample designs
-            # qcmu_N, t1_err, t2_err = utils.get_mean_from_cdf(
-            #     designmu_n,
-            #     designsigma_n,
-            #     ir,
-            #     (0, pos_int_limit),
-            #     (neg_int_limit, 0),
-            #     quad_limit=quad_limit,
-            #     err_norm='max',
-            #     tol=tol,
-            # )
-            # if t1_err > tol or t2_err > tol:
-            #     print('temp {:.4f}, trial {}, t1_err {:.4f}, t2_err {:.4f} ({} s)'.format(
-            #         temp, i, t1_err, t2_err, int(time() - t0)
-            #     ))
-            # cp_df.loc[i, 'qc_forecast_mean_temp{:.4f}'.format(temp)] = np.mean(qcmu_N)
-
-            # ----- conformal prediction-based baseline -----
-            # CP-based lower bound
-            # lb, lb_nobonf = get_conformal_prediction_lower_bound(
-            #     ycal_n, predcal_n, caldr_n, preddesign_N, designdr_N,
-            #     alpha=alpha / len(temperatures), batch_sz=cp_batch_sz
-            # )
-            # # conformal prediction-based test outcomes (reject/fail to reject)
-            # cp_df.loc[i, 'cp_lb_temp{:.4f}'.format(temp)] = lb
-            # cp_df.loc[i, 'cp_nobonf_lb_temp{:.4f}'.format(temp)] = lb_nobonf
-            # if lb_nobonf > -np.inf:
-            #     print('Temp {:.4f}, trial {} has CP-based LBs {:.4f} (Bonferroni), {:.4f} (uncorrected) ({} s)'.format(
-            #         temp, i, lb, lb_nobonf, int(time() - t0)
-            #     ))
-
                     
         print('Done with {} trials for temperature {:.4f} ({} / {}) ({} s).'.format(
             n_trial, temp, t + 1, len(temperatures), int(time() - t0)
         ))
         if pp_csv_fname is not None:
             df.to_csv(pp_csv_fname) # time sink
-            # cp_df.to_csv(cp_csv_fname)
+            forecast_df.to_csv(forecast_csv_fname)
             print('Saved PP results to {}.'.format(pp_csv_fname))
-            # print('Saved CP results to {} ({} s).\n'.format(cp_csv_fname, int(time() - t0)))
+            print('Saved CP and marginally calibrated forecasts results to {} ({} s).\n'.format(forecast_csv_fname, int(time() - t0)))
 
-    return df  # , cp_df
+    return df, forecast_df

@@ -44,15 +44,18 @@ class ExceedancePredictor():
         self.lr_fitted = False
 
     def fit(self, ohe_nxlxa: np.array, binary_y_n: np.array, weight_n=None):
-        pred_n = self.model.predict(ohe_nxlxa)
-        self.lr.fit(pred_n[:, None], binary_y_n, sample_weight=weight_n)
+        realpred_n = self.model.predict(ohe_nxlxa)
+        self.lr.fit(realpred_n[:, None], binary_y_n, sample_weight=weight_n)
         self.lr_fitted = True
 
     def predict(self, ohe_nxlxa: np.array):
+        realpred_n = self.model.predict(ohe_nxlxa)
+
         if not self.lr_fitted:
             # print('Warning: ExceedancePredictor has not been fit. Making predictions by thresholding.')
-            return (self.model.predict(ohe_nxlxa) >= self.threshold).astype(float)
-        return self.lr.predict_proba(self.model.predict(ohe_nxlxa)[:, None])[:, 1]
+            return (realpred_n >= self.threshold).astype(float)
+        
+        return self.lr.predict_proba(realpred_n[:, None])[:, 1]
 
 # TODO: subclass from TorchRegressorEnsemble
 # unfortunately cannot load existing saved EnrichmentFeedForward parameters into a FeedForward model

@@ -64,6 +64,29 @@ def get_mean_from_cdf(
 
 # ===== Wheelock et al. forecasts =====
 
+def get_exceedance_from_gmm_forecasts(
+    threshold: float,
+    designp_N: np.array,
+    designped_N: np.array,
+    designmued_N: np.array,
+    designmutilde_N: np.array,
+    designmuneg_N: np.array,
+    designsigplus_N: np.array,
+    designsigneg_N: np.array
+):
+    # w/ correction for covariate shift
+    sfplustilde_N = sc.stats.norm.sf(threshold, loc=designmutilde_N, scale=designsigplus_N)
+    sfneg_N = sc.stats.norm.sf(threshold, loc=designmuneg_N, scale=designsigneg_N)
+    exceedance_tilde = np.mean(designp_N * sfplustilde_N + (1 - designp_N) * sfneg_N)
+
+    # w/ correction to p and \tilde{\mu} for covariate shift,
+    # based on edit distance to the seed sequence
+    sfplused_N = sc.stats.norm.sf(threshold, loc=designmued_N, scale=designsigplus_N)
+    exceedance_ed = np.mean(designped_N * sfplused_N + (1 - designped_N) * sfneg_N)
+    return exceedance_tilde, exceedance_ed
+
+
+
 def otsu_threshold(y):
     # compute histogram, where bin edges are candidate thresholds
     bincount_t, binedge_t = np.histogram(y, bins=200, range=(np.min(y), np.max(y)))
@@ -90,47 +113,83 @@ def otsu_threshold(y):
     return threshold
 
 
-def wheelock_forecast(ytrain_n, trainpred_nxm, designpred_Nxm, q: float = 0):
+def wheelock_forecast(ytrain_n, trainpred_nxm, trained_n, designpred_Nxm, designed_N, qs = None):
+
+    if qs is None:
+        qs = [0, 0.5, 1]
+    else:
+        for q in qs:
+            assert((q <= 1.) and (q >= 0.))
+
     threshold = otsu_threshold(ytrain_n)
+
+    trainmu_n = np.mean(trainpred_nxm, axis=1)
+    trainsig2_n = np.var(trainpred_nxm, axis=1)
+    trainres2_n = np.square(ytrain_n - trainmu_n)
+    designmu_N = np.mean(designpred_Nxm, axis=1)
+    designsig2_N = np.var(designpred_Nxm, axis=1)
+
+    # ===== probability of functionality, p =====
     
-    mu_n = np.mean(trainpred_nxm, axis=1)
-    var_n = np.var(trainpred_nxm, axis=1)
-    res2_n = np.square(ytrain_n - mu_n)
     I_n = (ytrain_n >= threshold).astype(float)
+    irp = IsotonicRegression(out_of_bounds='clip')
+    irp.fit(trainmu_n, I_n)
+
+
+    # covariate shift correction
+    trainp_n = irp.predict(trainmu_n)
+    irpres = IsotonicRegression(out_of_bounds='clip')
+    irpres.fit(trained_n, trainp_n - I_n)
+
+
+    designp_N = irp.predict(designmu_N)
+    designpres_N = irpres.predict(designed_N)
+    designped_N = designp_N - designpres_N
+
+    # ===== means of functional and non functional modes, mu^+ and mu^- =====
 
     plus_idx = np.where(ytrain_n >= threshold)[0]
     neg_idx = np.where(ytrain_n < threshold)[0]
-    
-    irp = IsotonicRegression(out_of_bounds='clip')
-    irp.fit(mu_n, I_n)
 
     irmuplus = IsotonicRegression(out_of_bounds='clip')
-    irmuplus.fit(mu_n[plus_idx], ytrain_n[plus_idx])
+    irmuplus.fit(trainmu_n[plus_idx], ytrain_n[plus_idx])
     irmuneg = IsotonicRegression(out_of_bounds='clip')
-    irmuneg.fit(mu_n[neg_idx], ytrain_n[neg_idx])
-
-    irsigplus = IsotonicRegression(out_of_bounds='clip')
-    irsigplus.fit(var_n[plus_idx], res2_n[plus_idx])
-    irsigneg = IsotonicRegression(out_of_bounds='clip')
-    irsigneg.fit(var_n[neg_idx], res2_n[neg_idx])
-    
-    designmu_N = np.mean(designpred_Nxm, axis=1)
-    designvar_N = np.var(designpred_Nxm, axis=1)
-    
-    # forecast for designs
-    designp_N = irp.predict(designmu_N)
+    irmuneg.fit(trainmu_n[neg_idx], ytrain_n[neg_idx])
 
     designmuplus_N = irmuplus.predict(designmu_N)
     designmuneg_N = irmuneg.predict(designmu_N)
-    if q > 0:
-        ind_Nxn = (mu_n[None, :] < designmu_N[:, None]).astype(float)
-        designmucdf_N = np.mean(ind_Nxn, axis=1)
-        designmuplus_N = q * designmucdf_N * designmu_N + (1 - q * designmucdf_N) * designmuplus_N
 
-    designsigplus_N = irsigplus.predict(designvar_N)
-    designsigneg_N = irsigneg.predict(designvar_N)
-    
-    return designp_N, designmuplus_N, designmuneg_N, designsigplus_N, designsigneg_N
+    # ===== sigmas of functional and non-functional modes, sigma^+ and sigma^-=====
+
+    irsigplus = IsotonicRegression(out_of_bounds='clip')
+    irsigplus.fit(trainsig2_n[plus_idx], trainres2_n[plus_idx])
+    irsigneg = IsotonicRegression(out_of_bounds='clip')
+    irsigneg.fit(trainsig2_n[neg_idx], trainres2_n[neg_idx])
+
+    designsig2plus_N = irsigplus.predict(designsig2_N)
+    designsig2neg_N = irsigneg.predict(designsig2_N)
+
+    # ===== "semi-calibration" with covariate shift correction =====
+
+    ind_Nxn = (trainmu_n[None, :] < designmu_N[:, None]).astype(float)
+    designmucdf_N = np.mean(ind_Nxn, axis=1)
+    ind_nxn = (trainmu_n[:, None] < trainmu_n[None, :]).astype(float)
+    trainmucdf_n = np.mean(ind_nxn, axis=1)
+    trainmuplus_n = irmuplus.predict(trainmu_n)
+
+    q2functionalmus = {q: None for q in qs}
+    irres = IsotonicRegression(out_of_bounds='clip')  # predict residual from edit distance to seed
+    for q in qs:
+        trainmutilde_n = q * trainmucdf_n * trainmu_n + (1 - q * trainmucdf_n) * trainmuplus_n
+        trainres_n = trainmutilde_n - ytrain_n
+        irres.fit(trained_n, trainres_n)
+        
+        designmutilde_N = q * designmucdf_N * designmu_N + (1 - q * designmucdf_N) * designmuplus_N
+        designres_N = irres.predict(designed_N)
+        designmued_N = designmutilde_N - designres_N
+        q2functionalmus[q] = (designmutilde_N, designmued_N)
+
+    return designp_N, designped_N, q2functionalmus, designmuneg_N, designsig2plus_N, designsig2neg_N
 
 
 def wheelock_mean_forecast(ytrain_n, trainmu_n, trained_n, designmu_N, designed_N, qs = None):
@@ -146,7 +205,6 @@ def wheelock_mean_forecast(ytrain_n, trainmu_n, trained_n, designmu_N, designed_
     # ===== probability of functionality, p =====
     
     I_n = (ytrain_n >= threshold).astype(float)
-    
     irp = IsotonicRegression(out_of_bounds='clip')
     irp.fit(trainmu_n, I_n)
 
@@ -380,8 +438,8 @@ def process_gb1_selection_experiments(
     for v, val in enumerate(target_values):
         val = round(val, 4)
             
-        worst_t = []  # worst (i.e. lowest) mean label for each trial
-        temprange_t = []  # range of selected temperatures for each trial
+        worst_t = []  # worst (i.e. lowest) mean label for trials where a temperature was selected
+        temprange_t = []  # range of selected temperatures for trials where a temperature was selected
         
         for i in range(n_trial):
             selected = [temp for temp in temperatures if df.loc[val]['tr{}_{}_pval_temp{:.4f}'.format(i, imp_or_pp, temp)] < alpha_bonferroni]
