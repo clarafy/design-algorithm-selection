@@ -3,8 +3,6 @@ from time import time
 import abc
 from copy import deepcopy
 
-import torch
-
 from pandas import DataFrame
 import numpy as np
 import editdistance

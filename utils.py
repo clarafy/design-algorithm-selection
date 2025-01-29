@@ -1,4 +1,3 @@
-from time import time
 from multiprocessing.dummy import Pool
 from itertools import repeat
 
@@ -7,14 +6,39 @@ import scipy as sc
 from statsmodels.stats.weightstats import _zstat_generic
 from sklearn.isotonic import IsotonicRegression
 from scipy.integrate import quad_vec
-import matplotlib.pyplot as plt
 
-import flexs.utils.sequence_utils as s_utils
-
-import editdistance
 
 RNA_NUCLEOTIDES = 'UGCA'
 RNANUC2COMPLEMENT = {"A": "U", "C": "G", "G": "C", "U": "A"}
+
+
+# ===== general biological sequence utilities =====
+
+def get_mutant(seq, p_mut, alphabet):
+    mutant = []
+    for s in seq:
+        if np.random.rand() < p_mut:
+            mutant.append(np.random.choice(list(alphabet)))
+        else:
+            mutant.append(s)
+    return "".join(mutant)
+
+def str2onehot(sequence: str, alphabet: str) -> np.ndarray:
+    out = np.zeros((len(sequence), len(alphabet)))
+    for i in range(len(sequence)):
+        out[i, alphabet.index(sequence[i])] = 1
+    return out
+
+def ohes2strs(ohe_nxlxa, alphabet: str):
+    l = ohe_nxlxa.shape[1]
+    idx_nl = np.where(ohe_nxlxa)[2]
+    allseq = ''.join(alphabet[i] for i in idx_nl)
+    assert(len(allseq) % l == 0)
+    seq_n = [allseq[i : i + l] for i in range(0, len(allseq), l)]
+    return seq_n
+
+
+# ===== prediction-powered p-value =====
 
 def rectified_p_value(
     rectifier,
@@ -24,7 +48,7 @@ def rectified_p_value(
     null=0,
     alternative='larger',
 ):
-    """Computes a rectified p-value.
+    """Computes a prediction-powered p-value.
 
     Args:
         rectifier (float or ndarray): Rectifier value.
@@ -39,13 +63,14 @@ def rectified_p_value(
     """
     rectified_point_estimate = imputed_mean + rectifier
     rectified_std = np.maximum(
-        np.sqrt(imputed_std**2 + rectifier_std**2), 1e-16
+        np.sqrt(imputed_std ** 2 + rectifier_std ** 2), 1e-16
     )
     return _zstat_generic(
         rectified_point_estimate, 0, rectified_std, alternative, null
     )[1]
 
-# ===== quantile-calibrated forecasts =====
+
+# ===== CalibratedForecasts =====
 
 def calibrated_cdf_vec(y, predmu_n, predsigma_n, calibrator):
     F_n = sc.stats.norm.cdf(y, loc=predmu_n, scale=predsigma_n)
@@ -60,7 +85,6 @@ def get_mean_from_cdf(
     negative_int_limits,
     quad_limit: int = 200,
     err_norm: str = 'max',
-    tol: float = 0.005,
 ):
     if positive_int_limits is not None:
         assert(positive_int_limits[0] >= 0)
@@ -89,8 +113,7 @@ def get_mean_from_cdf(
     return term1_n - term2_n, term1_max_err, term2_max_err
     
 
-
-# ===== Wheelock et al. forecasts =====
+# ===== GMMForecasts =====
 
 def get_exceedance_from_gmm_forecasts(
     threshold: float,
@@ -112,7 +135,6 @@ def get_exceedance_from_gmm_forecasts(
     sfplused_N = sc.stats.norm.sf(threshold, loc=designmued_N, scale=designsigplus_N)
     exceedance_ed = np.mean(designped_N * sfplused_N + (1 - designped_N) * sfneg_N)
     return exceedance_tilde, exceedance_ed
-
 
 
 def otsu_threshold(y):
@@ -141,86 +163,8 @@ def otsu_threshold(y):
     return threshold
 
 
-def wheelock_forecast(ytrain_n, trainpred_nxm, trained_n, designpred_Nxm, designed_N, qs = None):
-
-    if qs is None:
-        qs = [0, 0.5, 1]
-    else:
-        for q in qs:
-            assert((q <= 1.) and (q >= 0.))
-
-    threshold = otsu_threshold(ytrain_n)
-
-    trainmu_n = np.mean(trainpred_nxm, axis=1)
-    trainsig2_n = np.var(trainpred_nxm, axis=1)
-    trainres2_n = np.square(ytrain_n - trainmu_n)
-    designmu_N = np.mean(designpred_Nxm, axis=1)
-    designsig2_N = np.var(designpred_Nxm, axis=1)
-
-    # ===== probability of functionality, p =====
-    
-    I_n = (ytrain_n >= threshold).astype(float)
-    irp = IsotonicRegression(out_of_bounds='clip')
-    irp.fit(trainmu_n, I_n)
-
-
-    # covariate shift correction
-    trainp_n = irp.predict(trainmu_n)
-    irpres = IsotonicRegression(out_of_bounds='clip')
-    irpres.fit(trained_n, trainp_n - I_n)
-
-
-    designp_N = irp.predict(designmu_N)
-    designpres_N = irpres.predict(designed_N)
-    designped_N = designp_N - designpres_N
-
-    # ===== means of functional and non functional modes, mu^+ and mu^- =====
-
-    plus_idx = np.where(ytrain_n >= threshold)[0]
-    neg_idx = np.where(ytrain_n < threshold)[0]
-
-    irmuplus = IsotonicRegression(out_of_bounds='clip')
-    irmuplus.fit(trainmu_n[plus_idx], ytrain_n[plus_idx])
-    irmuneg = IsotonicRegression(out_of_bounds='clip')
-    irmuneg.fit(trainmu_n[neg_idx], ytrain_n[neg_idx])
-
-    designmuplus_N = irmuplus.predict(designmu_N)
-    designmuneg_N = irmuneg.predict(designmu_N)
-
-    # ===== sigmas of functional and non-functional modes, sigma^+ and sigma^-=====
-
-    irsigplus = IsotonicRegression(out_of_bounds='clip')
-    irsigplus.fit(trainsig2_n[plus_idx], trainres2_n[plus_idx])
-    irsigneg = IsotonicRegression(out_of_bounds='clip')
-    irsigneg.fit(trainsig2_n[neg_idx], trainres2_n[neg_idx])
-
-    designsig2plus_N = irsigplus.predict(designsig2_N)
-    designsig2neg_N = irsigneg.predict(designsig2_N)
-
-    # ===== "semi-calibration" with covariate shift correction =====
-
-    ind_Nxn = (trainmu_n[None, :] < designmu_N[:, None]).astype(float)
-    designmucdf_N = np.mean(ind_Nxn, axis=1)
-    ind_nxn = (trainmu_n[:, None] < trainmu_n[None, :]).astype(float)
-    trainmucdf_n = np.mean(ind_nxn, axis=1)
-    trainmuplus_n = irmuplus.predict(trainmu_n)
-
-    q2functionalmus = {q: None for q in qs}
-    irres = IsotonicRegression(out_of_bounds='clip')  # predict residual from edit distance to seed
-    for q in qs:
-        trainmutilde_n = q * trainmucdf_n * trainmu_n + (1 - q * trainmucdf_n) * trainmuplus_n
-        trainres_n = trainmutilde_n - ytrain_n
-        irres.fit(trained_n, trainres_n)
-        
-        designmutilde_N = q * designmucdf_N * designmu_N + (1 - q * designmucdf_N) * designmuplus_N
-        designres_N = irres.predict(designed_N)
-        designmued_N = designmutilde_N - designres_N
-        q2functionalmus[q] = (designmutilde_N, designmued_N)
-
-    return designp_N, designped_N, q2functionalmus, designmuneg_N, designsig2plus_N, designsig2neg_N
-
-
 def gmm_mean_forecast(ytrain_n, trainmu_n, trained_n, designmu_N, designed_N, qs = None):
+    # don't need GMM sigma parameters when success criterion involves mean, e.g. Figs 3, 4
     if qs is None:
         qs = [0, 0.5, 1]
     else:
@@ -228,7 +172,6 @@ def gmm_mean_forecast(ytrain_n, trainmu_n, trained_n, designmu_N, designed_N, qs
             assert((q <= 1.) and (q >= 0.))
 
     threshold = otsu_threshold(ytrain_n)
-
 
     # ===== probability of functionality, p =====
     
@@ -283,7 +226,7 @@ def gmm_mean_forecast(ytrain_n, trainmu_n, trained_n, designmu_N, designed_N, qs
     return designp_N, designped_N, q2functionalmus, designmuneg_N
 
 
-# ===== conformal prediction-based lower bounds =====
+# ===== conformal prediction method =====
 
 def parallelized_cumsum(arr_bxn, out_bxn: np.array = None, return_copy: bool = False):
     # output array of matching size,
@@ -302,6 +245,7 @@ def parallelized_cumsum(arr_bxn, out_bxn: np.array = None, return_copy: bool = F
         )
 
     return out_bxn if return_copy else None
+
 
 def get_weighted_quantiles(scores_n, w_n, w_N, alpha, batch_sz: int = 100000):
     N = w_N.shape[0]
@@ -364,244 +308,3 @@ def get_conformal_prediction_lower_bound(
     lb = np.mean(preddesign_N - quantile_N)
     lb_nobonf = np.mean(preddesign_N - quantile_nobonf_N)
     return lb, lb_nobonf
-
-# ==========
-
-def get_mutant(seq, p_mut, alphabet):
-    mutant = []
-    for s in seq:
-        if np.random.rand() < p_mut:
-            mutant.append(np.random.choice(list(alphabet)))
-        else:
-            mutant.append(s)
-    return "".join(mutant)
-
-def str2onehot(sequence: str, alphabet: str) -> np.ndarray:
-    out = np.zeros((len(sequence), len(alphabet)))
-    for i in range(len(sequence)):
-        out[i, alphabet.index(sequence[i])] = 1
-    return out
-
-def ohes2strs(ohe_nxlxa, alphabet: str):
-    l = ohe_nxlxa.shape[1]
-    idx_nl = np.where(ohe_nxlxa)[2]
-    allseq = ''.join(alphabet[i] for i in idx_nl)
-    assert(len(allseq) % l == 0)
-    seq_n = [allseq[i : i + l] for i in range(0, len(allseq), l)]
-    return seq_n
-
-def rmse(x, y, axis=None):
-    return np.sqrt(np.mean(np.square(x - y), axis=axis))
-
-
-def plot_xy(x, y, s: int = 50, linewidth: float = 2, alpha: float = 0.8):
-    plt.scatter(x, y, s=s, alpha=alpha)
-    minval = np.min([np.min(x), np.min(y)])
-    maxval = np.max([np.max(x), np.max(y)])
-    plt.plot([minval, maxval], [minval, maxval], '--', c='orange', linewidth=linewidth)
-
-def process_flexs_outputs(df, alphabet, n_train: int):
-    # TODO: split calibration data properly
-    df1 = df[df['round'] == 1]
-    df2 = df[df['round'] == 2]
-    X0_nxd = np.array([s_utils.string_to_one_hot(seq, alphabet).flatten() for seq in df2.sequence[: n_train]])
-    y0_n = df2.true_score.to_numpy()
-    pred0_n = df2.model_score.to_numpy()
-    Xm_nxd = np.array([s_utils.string_to_one_hot(seq, alphabet).flatten() for seq in df1.sequence[: n_train]])
-    Xmcal_nxd = np.array([s_utils.string_to_one_hot(seq, alphabet).flatten() for seq in df1.sequence[n_train :]])
-    ymcal_n = df1.true_score.to_numpy()[n_train :]
-    predmcal_n = df1.model_score.to_numpy()[n_train:]
-    return X0_nxd, y0_n, pred0_n, Xm_nxd, Xmcal_nxd, ymcal_n, predmcal_n
-
-# ========== sequence distribution comparisons ==========
-
-def pairwise_distances(seqs1, seqs2, normalize: bool = True, n_pairs: int = 1000):
-    s1_n = np.random.choice(seqs1, size=n_pairs, replace=True)
-    s12_n = np.random.choice(seqs1, size=n_pairs, replace=True)
-    s13_n = np.random.choice(seqs1, size=n_pairs, replace=True)
-
-    s2_n = np.random.choice(seqs2, size=n_pairs, replace=True)
-    s22_n = np.random.choice(seqs2, size=n_pairs, replace=True)
-    s23_n = np.random.choice(seqs2, size=n_pairs, replace=True)
-
-    dists_between = np.array([editdistance.eval(s1, s2) for s1, s2 in zip(s1_n, s2_n)])
-    dists_within1 = np.array([editdistance.eval(s12, s13) for s12, s13 in zip(s12_n, s13_n)])
-    dists_within2 = np.array([editdistance.eval(s22, s23) for s22, s23 in zip(s22_n, s23_n)])
-    
-    if normalize:
-        l = len(seqs1[0])
-        print('Normalizing by sequence length {}'.format(l))
-        dists_between = dists_between / l
-        dists_within1 = dists_within1 / l
-        dists_within2 = dists_within2 / l
-    return dists_within1, dists_within2, dists_between
-
-
-# ========== plotting ==========
-    
-
-def process_rna_selection_experiments(
-    df,
-    target_values,
-    design_names,
-    name2truemeans,
-    n_trial: int,
-    imp_or_pp: str,
-    alpha: float = 0.1,
-    print_worst: bool = False
-):
-    n_config = len(design_names)
-    alpha_bonferroni = alpha / n_config
-    for name in design_names:
-        assert(name in name2truemeans)
-    print('Processing {} results with the following menu of size {}, {} target values in [{:.2f}, {:.2f}], {} trials, and alpha = {:.1f}:'.format(
-        imp_or_pp, n_config, target_values.shape[0], np.min(target_values), np.max(target_values), n_trial, alpha
-    ))
-    for name in design_names:
-        print(f'  {name}')
-
-    format_tokens = '{:.4f} '
-    format_str = '  {}: ' + ''.join(n_trial * [format_tokens])
-    report_high_var = False
-    for name, truemean_t in name2truemeans.items():
-        vmin, vmax = np.min(truemean_t), np.max(truemean_t)
-        if (vmax - vmin) / vmax > 0.05 * vmax:
-            if not report_high_var:
-                report_high_var = True
-                print('High-ish variance estimates of true mean labels for the following. Using the average:')
-            print(format_str.format(name, *truemean_t))
-
-    worst_v = []  # worst (i.e. lowest) mean label achieved by any selected configuration
-    err_v = []    # error rate
-    disc_v = []   # discovery rate
-    val2configs = {}  # map from target value to lists selected configurations (per trial)
-
-    t0 = time()
-    if print_worst:
-        print('Worst selected configuration for:')
-    for v, val in enumerate(target_values):
-        val = round(val, 4)
-        if print_worst:
-            print('Target value {:.4f}'.format(val))
-            
-        worst_t = []    # worst (i.e. lowest) mean label for each trial
-        configs_t = []  # selected configurations for each trial
-        
-        for i in range(n_trial):
-            selected = [name for name in design_names if df.loc[val]['tr{}_{}_pval_{}'.format(i, imp_or_pp, name)] < alpha_bonferroni]
-            achieved = [np.mean(name2truemeans[name]) for name in selected]
-
-            if len(selected):
-                worst_t.append(np.min(achieved))
-                configs_t.append(selected)
-
-                if worst_t[-1] < val and print_worst:
-                    idx = np.argmin(np.array(achieved))
-                    print('  Trial {} is {} with true mean label of {:.4f}'.format(i, selected[idx], worst_t[-1]))
-            # if no discovery/selection, no worst achieved value
-            else:
-                configs_t.append([])
-        if print_worst:
-            print()
-                
-        worst_v.append(worst_t)
-        err_v.append(np.sum(np.array(worst_t) < val) / n_trial) 
-        disc_v.append(len(worst_t) / n_trial)
-        val2configs[val] = configs_t
-        
-        if (v + 1) % 20 == 0:
-            print('Done processing {} / {} target values ({} s)'.format(v + 1, target_values.size, int(time() - t0)))
-
-    print('Done processing ({} s)'.format(int(time() - t0)))
-    return worst_v, err_v, disc_v, val2configs
-
-
-def process_wheelock_selection_experiments(
-    df,
-    target_values,
-    design_names,
-    name2truemeans,
-    n_trial: int,
-    qs: np.array
-):
-    type2results = {
-        'no-cs': {round(q, 2): None for q in qs},
-        'cs': {round(q, 2): None for q in qs} 
-    }
-    target_values = [round(val, 4) for val in target_values]
-
-    for cs in ['no-cs', 'cs']:
-        s = 'cs_' if cs == 'cs' else ''
-        for q in qs:
-
-            val2selected = {val: [] for val in target_values}
-            for i in range(n_trial):
-                for val in target_values:
-                    val2selected[val].append([])
-
-                for name in design_names:
-                    forecast = df.loc[i]['wf_mean_q{:.2f}_{}{}'.format(q, s, name)]
-
-                    for val in target_values:
-                        if val <= forecast:
-                            val2selected[val][i].append(name)
-
-            worst_v = []
-            err_v = []
-            disc_v = []
-            for val in target_values:                    
-                worst_t = []    # worst (i.e. lowest) mean label for each trial
-                for i in range(n_trial):
-                    achieved = [np.mean(name2truemeans[name]) for name in val2selected[val][i]]
-                    if len(achieved):
-                        worst_t.append(np.min(achieved))
-                    # if no discovery/selection, no worst achieved value
-                        
-                worst_v.append(worst_t)
-                err_v.append(np.sum(np.array(worst_t) < val) / n_trial) 
-                disc_v.append(len(worst_t) / n_trial)
-            
-            type2results[cs][q] = (worst_v, err_v, disc_v, val2selected)
-            
-    return type2results
-
-
-def process_rna_qc_selection_experiments(
-    df,
-    target_values,
-    design_names,
-    name2truemeans,
-    n_trial: int,
-):
-    target_values = [round(val, 4) for val in target_values]
-    val2selected = {val: [] for val in target_values}
-    for i in range(n_trial):
-        for val in target_values:
-            val2selected[val].append([])
-
-        for name in design_names:
-            forecast = df.loc[i][f'qc_forecast_mean_{name}']
-
-            for val in target_values:
-                if val <= forecast:
-                    val2selected[val][i].append(name)
-
-    worst_v = []
-    err_v = []
-    disc_v = []
-    for val in target_values:                    
-        worst_t = []    # worst (i.e. lowest) mean label for each trial
-        for i in range(n_trial):
-            achieved = [np.mean(name2truemeans[name]) for name in val2selected[val][i]]
-            if len(achieved):
-                worst_t.append(np.min(achieved))
-            # if no discovery/selection, no worst achieved value
-                
-        worst_v.append(worst_t)
-        err_v.append(np.sum(np.array(worst_t) < val) / n_trial) 
-        disc_v.append(len(worst_t) / n_trial)
-                        
-    return worst_v, err_v, disc_v
-
-
-    
