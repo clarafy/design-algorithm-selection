@@ -2,7 +2,6 @@ import copy
 from tqdm import tqdm
 from time import time
 import re
-import pickle
 
 import numpy as np
 import pandas as pd
@@ -10,7 +9,6 @@ from scipy.stats import norm
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from models import type_check_and_one_hot_encode_sequences
 from utils import RNA_NUCLEOTIDES
@@ -98,7 +96,6 @@ class MultiMDRE():
             self.idx2mdre[i] = mdre
             self.idx2lossdf[i] = loss_df
             
-
     def get_dr(
             self,
             calseq_n,
@@ -151,47 +148,6 @@ class QuadraticLayer(nn.Module):
         out_bxo = quad_oxb.T + lin_bxo + self.bias_o.unsqueeze(0)
         
         return out_bxo
-
-
-class MultiInputNN(nn.Module):
-    def __init__(self, seq_len, alphabet_sz, n_hidden, n_distribution):
-        super(MultiInputNN, self).__init__()
-        
-        # layers for the first input
-        self.flatten = nn.Flatten()
-        self.seqinput_fc1 = nn.Linear(seq_len * alphabet_sz, n_hidden)
-        # self.input1_fc2 = nn.Linear(n_hidden, n_hidden)
-        self.dropout1 = nn.Dropout(p=0.5)
-        
-        # layers for the second input
-        self.predinput_fc1 = nn.Linear(1, 1)
-        # self.input2_fc2 = nn.Linear(hidden_dim, hidden_dim)
-        
-        # layers for the combined input
-        self.combined_fc1 = nn.Linear(n_hidden + 1, n_hidden)
-        self.dropout2 = nn.Dropout(p=0.5)
-        # self.output_fc = nn.Linear(n_hidden, n_distribution)
-        self.output_fc = QuadraticLayer(n_hidden + 1, n_distribution)
-
-    def forward(self, X_nxlxa, x_nx1):
-        # Forward pass for the first input
-        X_nxla = self.flatten(X_nxlxa)
-        X_nxh = F.relu(self.seqinput_fc1(X_nxla))
-        X_nxh = self.dropout1(X_nxh)
-        
-        # Forward pass for the second input
-        x_nx1 = F.relu(self.predinput_fc1(x_nx1))
-        
-        # Concatenate the outputs from both inputs
-        cat_nxh1 = torch.cat((X_nxh, x_nx1), dim=1)
-        
-        # Forward pass for the combined inputs
-        # combined = F.relu(self.combined_fc1(cat_nxh1))
-        # combined = self.dropout2(combined)
-        # output = self.output_fc(combined)
-        output = self.output_fc(cat_nxh1)
-        
-        return output
     
     
 class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
@@ -226,7 +182,6 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
                 nn.Dropout(p=0.5),
                 nn.Linear(n_hidden, n_distribution),
             )
-        # self.model = MultiInputNN(seq_len, len(alphabet), n_hidden, n_distribution)
         self.model.to(device=device, dtype=dtype)
         self.Xmean_lxa = None
         self.Xstd_lxa = None
@@ -267,7 +222,6 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
         # `self.designname2idx[name]` gives the index i such that
         # tX_nxlxa_m[i] gives the sequence representations corresponding to `name`.
         tX_nxlxa_m = []
-        # tpred_nx1_m = []
         if verbose:
             print('One-hot-encoding all {} categories of sequences...'.format(self.n_distribution))
 
@@ -286,46 +240,37 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
 
             # convert to tensors
             tX_nxlxa_m.append(torch.from_numpy(X_nxlxa).to(device=self.device, dtype=self.dtype))
-            # tpred_nx1_m.append(torch.from_numpy(pred_n[:, None]).to(device=self.device, dtype=self.dtype))
         if verbose:
             print('  Done. ({} s)'.format(int(time() - t0)))
         
         if val_frac > 0:
             Xtr_nxd_m = []
-            predtr_nx1_m = []
             ztr_n_m = []  # categorical labels for the different design distributions
             Xval_nxd_m = []
-            predval_nx1_m = []
             zval_n_m = []
             for k, X_nxlxa in enumerate(tX_nxlxa_m):
                 n = X_nxlxa.shape[0]
                 n_val = int(val_frac * n)
 
                 Xtr_nxd_m.append(X_nxlxa[n_val :])
-                # predtr_nx1_m.append(pred_nx1[n_val :])
                 ztr_n_m.append(
                     k * torch.ones((X_nxlxa[n_val :].shape[0]), device=self.device, dtype=torch.int64)
                 )
 
                 Xval_nxd_m.append(X_nxlxa[: n_val])
-                # predval_nx1_m.append(pred_nx1[: n_val])
                 zval_n_m.append(
                     k * torch.ones((X_nxlxa[: n_val].shape[0]), device=self.device, dtype=torch.int64)
                 )
             
             Xtr_mnxd = torch.cat(Xtr_nxd_m, dim=0)
-            # predtr_mnx1 = torch.cat(predtr_nx1_m, dim=0)
             ztr_mn = torch.cat(ztr_n_m, dim=0)
 
             # for input feature normalization
             # d is shorthand for lxa
             self.Xmean_lxa = Xtr_mnxd.mean(dim=0)
             self.Xstd_lxa = Xtr_mnxd.std(dim=0)
-            # self.predmean = predtr_mnx1.mean()
-            # self.predstd = predtr_mnx1.std()
 
             Xval_mnxd = torch.cat(Xval_nxd_m, dim=0)
-            # predval_mnx1 = torch.cat(predval_nx1_m)
             zval_mn = torch.cat(zval_n_m, dim=0)
 
             if weight_loss:
@@ -382,12 +327,12 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
             if val_frac > 0:
                 with torch.no_grad():
                     self.model.eval()
-                    vallogits = self.model(Xval_mnxd) # , predval_mnx1)
+                    vallogits = self.model(Xval_mnxd)
                     val_loss = val_loss_fn(vallogits, zval_mn)
                     self.model.train()
 
             self.model.zero_grad()
-            trlogits = self.model(Xtr_mnxd) # , predtr_mnx1)
+            trlogits = self.model(Xtr_mnxd)
             train_loss = tr_loss_fn(trlogits, ztr_mn)
 
             if val_frac > 0 and val_loss < best_loss:
@@ -412,15 +357,13 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
 
     def forward(self, tX_nxlxa: torch.Tensor):
         tX_nxlxa = (tX_nxlxa - self.Xmean_lxa) / self.Xstd_lxa
-        # tpred_nx1 = (tpred_nx1 - self.predmean) / self.predstd
-        return self.model(tX_nxlxa) # , tpred_nx1)
+        return self.model(tX_nxlxa)
 
     def get_dr(self, seq_n: np.array, self_normalize: bool = True):
         X_nxlxa = type_check_and_one_hot_encode_sequences(seq_n, self.alphabet)
         tX_nxlxa = torch.from_numpy(X_nxlxa).to(device=self.device, dtype=self.dtype)
-        # tpred_nx1 = torch.from_numpy(pred_n[:, None]).to(device=self.device, dtype=self.dtype)
 
-        th_nxm = self(tX_nxlxa) # , tpred_nx1)
+        th_nxm = self(tX_nxlxa)
         # train distribution is category 0
         ldr_nxm = (th_nxm[:, 1 :] - th_nxm[:, 0][:, None]).cpu().detach().numpy()
     
@@ -434,153 +377,4 @@ class MultinomialLogisticRegresssionDensityRatioEstimator(nn.Module):
         
         designname2dr = {name: dr_nxm[:, idx - 1] for name, idx in self.designname2idx.items()} 
         return designname2dr
-
-
-def select_intermediate_iterations(
-    name2designdata,
-    design_name_prefix,
-    threshold,
-    n_iter: int = 20,
-    verbose: bool = True,
-):
-    # check have designs for all candidate iterations
-    all_names = []
-    for i in range(n_iter):
-        name = '{}t{}'.format(design_name_prefix, i)
-        all_names.append(name)
-        if name not in name2designdata:
-            print(f'No design data for {name}, exiting MDRE select_intermediate_iterations.')
-            return None
-    
-    # find interval between iterations where the mean difference in consecutive mean predictions
-    # surpasses threshold
-    threshold_satisfied = False
-    for interval in range(1, int(n_iter / 2) + 1):
-        
-        # extract iterations an interval apart
-        iters = list(range(interval - 1, n_iter, interval)) + [n_iter - 1]
-        iters = list(set(iters))
-        iters.sort()
-        
-        # compute difference in consecutive mean predictions
-        mean_preds = []
-        names = []
-        for i in iters:
-            name = '{}t{}'.format(design_name_prefix, i)
-            names.append(name)
-            _, _, preddesign_n = name2designdata[name]
-            mean_preds.append(np.mean(preddesign_n))
-
-        mean_consecutive_diff = np.mean(np.ediff1d(mean_preds))
-        if verbose:
-            print('Iterations {} (interval {}) have mean consecutive diff in mean prediction of {:.3f}.'.format(
-                iters, interval, mean_consecutive_diff
-            ))
-        
-        # check if surpasses threshold
-        if mean_consecutive_diff > threshold:
-            threshold_satisfied = True
-            break
-    
-    # if no interval surpasses threshold, just return the final design distributions
-    if not threshold_satisfied:
-        names = ['{}t{}'.format(design_name_prefix, n_iter - 1)]
-        _, _, preddesign_n = name2designdata[names[0]]
-        if verbose:
-            print('Returning iteration {} with mean prediction {:.3f}.'.format(
-                n_iter - 1, np.mean(preddesign_n)
-            ))
-        iters = [n_iter - 1]
-    
-    # names to remove
-    for name in names:
-        all_names.remove(name)
-    
-    return iters, all_names
-
-
-def is_intermediate_iteration_name(design_name: str, n_iter: int = 20):
-    tok = design_name.split('-')  
-    if 't' in tok[-1]:
-        tok2 = tok[-1].split('t')
-        if int(tok2[-1]) < n_iter - 1: # e.g. cbas-ridge-0.1t0
-            return True
-        
-
-def prepare_name2designdata(
-        design_pkl_fname,
-        train_fname,
-        intermediate_iter_threshold: float = 0.1,
-        verbose: bool = True,
-    ):
-    # removes extraneous distributions that we aren't interested in testing
-    # (except for intermediate iters for C/DbAS)
-
-    # load labeled designs from all design algorithms
-    with open(design_pkl_fname, 'rb') as f:
-        name2designdata = pickle.load(f)
-    for name, data in name2designdata.items():  # make sure all sequences are labeled 
-        if data[1] is None and not is_intermediate_iteration_name(name):
-            raise ValueError(f'No labels for {name}')
-
-    # load labeled training sequences
-    d = np.load(train_fname)
-    trainseqs_n = list(d['trainseq_n'])
-    ytrain_n = d['ytrain_n']
-    if verbose:
-        print(f'Loaded {ytrain_n.size} training points from {train_fname}.\n')
-    name2designdata['train'] = (trainseqs_n, ytrain_n, None)
-
-    # remove DbAS q > 0.3
-    for threshold in np.arange(0.3, 0.91, 0.1):
-        for it in range(20):
-            name = 'dbas-ridge-{:.1f}t{}'.format(threshold, it)
-            if name in name2designdata:
-                del name2designdata[name]
-                if verbose:
-                    print(f'Removed {name} designs.')
-    
-    # remove Biswas
-    for temperature in [0.05, 0.03]:
-        temp = round(temperature, 4)
-        for model_name in ['ridge', 'ff', 'cnn']:
-            name = f'biswas-{model_name}-{temp}'
-            if name in name2designdata:
-                del name2designdata[name]
-                if verbose:
-                    print(f'Removed {name} designs.')
-
-    # select intermediate C/DbAS ridge iterations to facilitate DRE for C/DbAS ridge design distributions
-    for threshold in np.arange(0.1, 1, 0.1):
-        for weight_type in ['c', 'd']:
-            prefix =  '{}bas-ridge-{:.1f}'.format(weight_type, threshold)
-            out = select_intermediate_iterations(
-                name2designdata,
-                prefix,
-                intermediate_iter_threshold,
-                verbose=verbose
-            )
-            if out is not None:
-                iters, names_to_remove = out
-                if verbose:
-                    print(f'Using the following iterations for {prefix}: {iters}.')
-                    
-                for name in names_to_remove:
-                    if name in name2designdata:
-                        del name2designdata[name] 
-                        if verbose:
-                            print(f'  Removed {name}')
-                    
-    if verbose:
-        print('Design names:')
-        for name in name2designdata:
-            print(name)
-    return name2designdata
-
-
-
-    
-
-
-
     
