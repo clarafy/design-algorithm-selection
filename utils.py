@@ -4,6 +4,7 @@ from itertools import repeat
 
 import numpy as np
 import scipy as sc
+from statsmodels.stats.weightstats import _zstat_generic
 from sklearn.isotonic import IsotonicRegression
 from scipy.integrate import quad_vec
 import matplotlib.pyplot as plt
@@ -14,6 +15,35 @@ import editdistance
 
 RNA_NUCLEOTIDES = 'UGCA'
 RNANUC2COMPLEMENT = {"A": "U", "C": "G", "G": "C", "U": "A"}
+
+def rectified_p_value(
+    rectifier,
+    rectifier_std,
+    imputed_mean,
+    imputed_std,
+    null=0,
+    alternative='larger',
+):
+    """Computes a rectified p-value.
+
+    Args:
+        rectifier (float or ndarray): Rectifier value.
+        rectifier_std (float or ndarray): Rectifier standard deviation.
+        imputed_mean (float or ndarray): Imputed mean.
+        imputed_std (float or ndarray): Imputed standard deviation.
+        null (float, optional): Value of the null hypothesis to be tested. Defaults to `0`.
+        alternative (str, optional): Alternative hypothesis, either 'two-sided', 'larger' or 'smaller'.
+
+    Returns:
+        float or ndarray: P-value.
+    """
+    rectified_point_estimate = imputed_mean + rectifier
+    rectified_std = np.maximum(
+        np.sqrt(imputed_std**2 + rectifier_std**2), 1e-16
+    )
+    return _zstat_generic(
+        rectified_point_estimate, 0, rectified_std, alternative, null
+    )[1]
 
 # ===== quantile-calibrated forecasts =====
 

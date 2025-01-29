@@ -12,8 +12,7 @@ from Bio.Seq import Seq
 
 from models import EnrichmentFeedForward
 import utils
-from utils import str2onehot, editdistance, ohes2strs, gmm_mean_forecast
-from calibrate import rectified_p_value
+from utils import str2onehot, editdistance, ohes2strs, gmm_mean_forecast, rectified_p_value
 
 AA2CODON = {
         'l': ['tta', 'ttg', 'ctt', 'ctc', 'cta', 'ctg'],
@@ -592,10 +591,6 @@ def select_for_mean_with_labeled_data(
                 err_norm='max',
                 tol=tol,
             )
-            if t1_err > tol or t2_err > tol:
-                print('temp {:.4f}, trial {}, t1_err {:.4f}, t2_err {:.4f} ({} s)'.format(
-                    temp, i, t1_err, t2_err, int(time() - t0)
-                ))
             cal_df.loc[i, 'cal_mean_temp{:.4f}'.format(temp)] = np.mean(calmu_N)
                     
         print('Done with {} trials for temperature {:.4f} ({} / {}) ({} s).'.format(
