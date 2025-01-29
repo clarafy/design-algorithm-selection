@@ -18,7 +18,7 @@ import designers
 from dre import MultiMDRE, prepare_name2designdata, is_intermediate_iteration_name
 import utils
 from utils import RNA_NUCLEOTIDES, RNANUC2COMPLEMENT, get_mutant, get_conformal_prediction_lower_bound, editdistance, wheelock_mean_forecast
-from calibrate import rectified_p_value
+from utils import rectified_p_value
 
 
 # ===== ViennaRNA binding landscape =====

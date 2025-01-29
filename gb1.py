@@ -296,23 +296,6 @@ def get_density_ratios(aaohe_nxlxa: np.array, theta_lxa: np.array, logptrain_n: 
         logptrain_n = get_nostop_loglikelihood(aaohe_nxlxa, PAA_NNK_LXA)
     return np.exp(logpdesign_n - logptrain_n)
 
-# TODO: can delete, just convenient for debugging
-def get_true_mean_prediction_from_theta(temp2theta, model, threshold: float = None, verbose: bool = False):
-    temp2mean = {}
-    if verbose:
-        print('True mean prediction for temperature...')
-    t0 = time()
-    pred_n = model.predict(ALL_NOSTOP_AA_OHE)
-    if threshold is not None:
-        pred_n = (pred_n >= threshold).astype(float)
-    for temp, theta_lxa in temp2theta.items():
-        paa_lxa = get_aa_probs_from_nuc_probs(normalize_theta(theta_lxa))
-        pdesign_n = np.exp(get_nostop_loglikelihood(ALL_NOSTOP_AA_OHE, paa_lxa))
-        truemean = np.sum([p * pred for p, pred in zip(pdesign_n, pred_n)])
-        temp2mean[temp] = truemean
-        if verbose:
-            print('    {:.4f} is {:.4f}. ({} sec)'.format(temp, truemean, int(time() - t0)))
-    return temp2mean
 
 def get_true_mean_label_from_theta(temp2theta, threshold: float = None, verbose: bool = False):
     temp2mean = {}
@@ -550,28 +533,28 @@ def select_for_mean_with_labeled_data(
             # predictions for labeled sequences
             predcal_nxm = model.ensemble_predict(calohe_nxlxa)
             predcal_n = np.mean(predcal_nxm, axis=1, keepdims=False)
-            # callogptrain_n = get_nostop_loglikelihood(calohe_nxlxa, PAA_NNK_LXA)
+            callogptrain_n = get_nostop_loglikelihood(calohe_nxlxa, PAA_NNK_LXA)
 
-            # # density ratios for labeled sequences
-            # caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa, logptrain_n=callogptrain_n)
-            # caldr_n = caldr_n / np.sum(caldr_n) * caldr_n.size  # self-normalize importance weights
+            # density ratios for labeled sequences
+            caldr_n = get_density_ratios(calohe_nxlxa, theta_lxa, logptrain_n=callogptrain_n)
+            caldr_n = caldr_n / np.sum(caldr_n) * caldr_n.size  # self-normalize importance weights
         
-            # # rectifier sample mean and standard error
-            # rect_n = caldr_n * (ycal_n - predcal_n)
-            # rectifier_mean = np.mean(rect_n)
-            # rectifier_se = np.std(rect_n) / np.sqrt(rect_n.size)
+            # rectifier sample mean and standard error
+            rect_n = caldr_n * (ycal_n - predcal_n)
+            rectifier_mean = np.mean(rect_n)
+            rectifier_se = np.std(rect_n) / np.sqrt(rect_n.size)
 
-            # # ===== PP (our method) =====
-            # for tau in desired_values:
-            #     pp_pval = rectified_p_value(
-            #         rectifier_mean,
-            #         rectifier_se,
-            #         imputed_mean,
-            #         imputed_se,
-            #         null=tau,
-            #         alternative='larger'
-            #     )
-            #     pp_df.loc[tau]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
+            # ===== PP (our method) =====
+            for tau in desired_values:
+                pp_pval = rectified_p_value(
+                    rectifier_mean,
+                    rectifier_se,
+                    imputed_mean,
+                    imputed_se,
+                    null=tau,
+                    alternative='larger'
+                )
+                pp_df.loc[tau]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
 
             # ===== calibrated forecasts method =====
             calsigma_n = np.std(predcal_nxm, axis=1, keepdims=False)

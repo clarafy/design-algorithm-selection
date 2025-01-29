@@ -57,8 +57,8 @@ class ExceedancePredictor():
         
         return self.lr.predict_proba(realpred_n[:, None])[:, 1]
 
-# TODO: subclass from TorchRegressorEnsemble
-# unfortunately cannot load existing saved EnrichmentFeedForward parameters into a FeedForward model
+
+# functionally same thing as FeedForward, just forgot to subclass from TorchRegressorEnsemble
 class EnrichmentFeedForward(torch.nn.Module):  
     def __init__(
         self,
@@ -201,9 +201,8 @@ class EnrichmentFeedForward(torch.nn.Module):
         torch.save(self.state_dict(), fname)
         print('Saved models to {}.'.format(fname))
     
-    def load(self, save_fname_no_ftype, save_path: str = '/data/wongfanc/gb1-models'):
-        fname = os.path.join(save_path, save_fname_no_ftype + '.pt')
-        self.load_state_dict(torch.load(fname))
+    def load(self, save_fname):
+        self.load_state_dict(torch.load(save_fname))
 
 
 class TorchRegressorEnsemble(torch.nn.Module):
