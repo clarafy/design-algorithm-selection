@@ -41,7 +41,6 @@ def get_mean_from_cdf(
             limit=quad_limit,
             norm=err_norm
         )
-        # assert(term1_max_err < tol)
     else:
         term1_n = np.zeros(predmu_n.shape)
 
@@ -54,7 +53,6 @@ def get_mean_from_cdf(
             limit=quad_limit,
             norm=err_norm
         )
-        # assert(term2_max_err < tol)
     else:
         term2_n = np.zeros(predmu_n.shape)
 
@@ -192,7 +190,7 @@ def wheelock_forecast(ytrain_n, trainpred_nxm, trained_n, designpred_Nxm, design
     return designp_N, designped_N, q2functionalmus, designmuneg_N, designsig2plus_N, designsig2neg_N
 
 
-def wheelock_mean_forecast(ytrain_n, trainmu_n, trained_n, designmu_N, designed_N, qs = None):
+def gmm_mean_forecast(ytrain_n, trainmu_n, trained_n, designmu_N, designed_N, qs = None):
     if qs is None:
         qs = [0, 0.5, 1]
     else:
@@ -410,55 +408,6 @@ def pairwise_distances(seqs1, seqs2, normalize: bool = True, n_pairs: int = 1000
 
 
 # ========== plotting ==========
-
-def process_gb1_selection_experiments(
-    df,
-    target_values,
-    temperatures,
-    temp2mean,
-    n_trial: int,
-    imp_or_pp: str = 'imp',
-    alpha: float = 0.1
-):
-
-    n_temp = temperatures.shape[0]
-    alpha_bonferroni = alpha / n_temp
-    print('Processing {} results with {} temperatures in [{:.3f}, {:.3f}], {} target values in [{:.2f}, {:.2f}], {} trials, and alpha = {:.1f}'.format(
-        imp_or_pp, n_temp, np.min(temperatures), np.max(temperatures),
-        target_values.shape[0], np.min(target_values), np.max(target_values),
-        n_trial, alpha
-    ))
-
-    worst_v = []  # worst (i.e. lowest) mean label achieved by any selected temperature
-    err_v = []    # error rate
-    disc_v = []   # discovery rate
-    val2temprange = {}  # map from target value to range of selected temperatures
-
-    t0 = time()
-    for v, val in enumerate(target_values):
-        val = round(val, 4)
-            
-        worst_t = []  # worst (i.e. lowest) mean label for trials where a temperature was selected
-        temprange_t = []  # range of selected temperatures for trials where a temperature was selected
-        
-        for i in range(n_trial):
-            selected = [temp for temp in temperatures if df.loc[val]['tr{}_{}_pval_temp{:.4f}'.format(i, imp_or_pp, temp)] < alpha_bonferroni]
-            achieved = [temp2mean[round(t, 4)] for t in selected]
-
-            if len(selected):
-                worst_t.append(np.min(achieved))
-                temprange_t.append([np.min(selected), np.max(selected)])
-            # if no discovery/selection, no worst achieved value
-            else:
-                temprange_t.append([])
-                
-        worst_v.append(worst_t)
-        err_v.append(np.sum(np.array(worst_t) < val) / n_trial) 
-        disc_v.append(len(worst_t) / n_trial)
-        val2temprange[val] = temprange_t
-
-    print('Done processing ({} s)'.format(int(time() - t0)))
-    return worst_v, err_v, disc_v, val2temprange
     
 
 def process_rna_selection_experiments(
@@ -586,46 +535,6 @@ def process_wheelock_selection_experiments(
             
     return type2results
 
-
-def process_gb1_cp_selection_experiments(
-    df,
-    target_values,
-    temperatures,
-    temp2mean,
-    n_trial: int,
-):
-    target_values = [round(val, 4) for val in target_values]
-    temperatures = [round(temp, 4) for temp in temperatures]
-    val2selected = {val: [] for val in target_values}
-
-    # for each target value, collect the selected temperatures for that desired value
-    for i in range(n_trial):
-        for val in target_values:
-            val2selected[val].append([])
-
-        for temp in temperatures:
-            forecast = df.loc[i]['qc_forecast_mean_temp{:.4f}'.format(temp)]  # cp_nobonf_lb_
-
-            for val in target_values:
-                if forecast >= val:
-                    val2selected[val][i].append(temp)
-
-    worst_v = []
-    err_v = []
-    disc_v = []
-    for val in target_values:                    
-        worst_t = []    # worst (i.e. lowest) mean label for each trial
-        for i in range(n_trial):
-            achieved = [np.mean(temp2mean[temp]) for temp in val2selected[val][i]]
-            if len(achieved):
-                worst_t.append(np.min(achieved))
-            # if no discovery/selection, no worst achieved value
-                
-        worst_v.append(worst_t)
-        err_v.append(np.sum(np.array(worst_t) < val) / n_trial) 
-        disc_v.append(len(worst_t) / n_trial)
-                        
-    return worst_v, err_v, disc_v
 
 def process_rna_qc_selection_experiments(
     df,
