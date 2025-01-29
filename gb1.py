@@ -389,7 +389,7 @@ def select_for_mean_without_labeled_data(
                 )
                 designseq_N = ohes2strs(designohe_nxlxa, AA)  # TODO: memory probably can't handle all of this
                 designed_n = np.array([editdistance.eval(WT_GB1, seq) for seq in designseq_N])
-                print('Sampled {} design sequences for temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
+                print('Sampled {} design sequences using temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
                 if save_design_samples:
                     design_samples_fname = os.path.join(save_path, '{}-t{:.4f}-{}.npz'.format(design_samples_fname_prefix, temp, i))
                     np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
@@ -498,7 +498,7 @@ def select_for_mean_with_labeled_data(
             _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
                 theta_lxa, n_design, normalize=True, reject_stop_codon=True
             )
-            print('Sampled {} design sequences for temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
+            print('Sampled {} design sequences using temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
             if save_design_samples:
                 design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
                 np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
