@@ -102,7 +102,6 @@ class MultiMDRE():
     def get_dr(
             self,
             calseq_n,
-            # calpred_n,
             design_name: str,
             self_normalize: bool = True,
             verbose: bool = False

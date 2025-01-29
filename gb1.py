@@ -49,12 +49,12 @@ WT_GB1 = 'vdgv'
 NUCLEOTIDES = 'atcg'
 NUC2IDX = {nuc: idx for idx, nuc in enumerate(NUCLEOTIDES)}
 
-df = read_csv('/homefs/home/wongfanc/density-ratio-estimation/data/gb1-with-variance.csv')
-seq_n = list(df['Variants'].str.lower())
-y_n = df['log_fitness'].to_numpy()
-var_n = df['estimated_variance'].to_numpy()
-SEQ2YVAR = {seq: [y, var] for seq, y, var in zip(seq_n, y_n, var_n)}
-assert(set(seq_n) == set(ALL_NOSTOP_AA_SEQS))
+df = read_csv('gb1-models/gb1-data.csv')
+GB1_ALL_SEQS = list(df['Variants'].str.lower())
+GB1_ALL_Y = df['log_fitness'].to_numpy()
+GB1_ALL_VAR = df['estimated_variance'].to_numpy()
+SEQ2YVAR = {seq: [y, var] for seq, y, var in zip(GB1_ALL_SEQS, GB1_ALL_Y, GB1_ALL_VAR)}
+assert(set(GB1_ALL_SEQS) == set(ALL_NOSTOP_AA_SEQS))
 
 DEFAULT_GMM_QS = [0, 0.5, 1]
 
