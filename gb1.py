@@ -11,8 +11,10 @@ from statsmodels.stats.weightstats import _zstat_generic
 from Bio.Seq import Seq
 
 from models import EnrichmentFeedForward
-import utils
-from utils import str2onehot, editdistance, ohes2strs, gmm_mean_forecast, rectified_p_value
+from utils import str2onehot, editdistance, ohes2strs, gmm_mean_forecast, rectified_p_value, get_mean_from_cdf
+
+
+# ===== constants =====
 
 AA2CODON = {
         'l': ['tta', 'ttg', 'ctt', 'ctc', 'cta', 'ctg'],
@@ -58,7 +60,8 @@ assert(set(GB1_ALL_SEQS) == set(ALL_NOSTOP_AA_SEQS))
 
 DEFAULT_GMM_QS = [0, 0.5, 1]
 
-# ===== sampling sequences from design distribution =====
+
+# ===== sampling sequences from design distributions q_\lambda =====
         
 def normalize_theta(theta_lxa, compute_log: bool = False):
     """
@@ -71,6 +74,7 @@ def normalize_theta(theta_lxa, compute_log: bool = False):
     if compute_log:
         return logp_lxa
     return np.exp(logp_lxa)
+
 
 def sample_ohe_from_nuc_distribution(p_lxa, n_seq, normalize: bool = False, reject_stop_codon: bool = True):
     """
@@ -129,6 +133,7 @@ def sample_ohe_from_nuc_distribution(p_lxa, n_seq, normalize: bool = False, reje
 
     return nucohe_nxlxa[accepted_proposal_idx], aaohe_nxlxa, aaseq_n
 
+
 def get_aa_probs_from_nuc_probs(pnuc_lxa: np.array):
     """
     Computes amino acid site-wise categorical distribution probabilities
@@ -148,7 +153,7 @@ def get_aa_probs_from_nuc_probs(pnuc_lxa: np.array):
     return np.array(paa_axl).T
 
 
-# ===== solving optimization problem to define design distribution =====
+# ===== solving optimization problem for design distribution, q_\lambda in main text =====
 
 # NNK library (training sequence distribution):
 # nucleotide categorical distributions per site in one codon
@@ -162,6 +167,7 @@ PNUC_NNK_LXA = np.tile(PNUC_NNK_ONECODON, [4, 1])
 # amino acid categorical distribution corresponding to NNK
 PAA_NNK_LXA = get_aa_probs_from_nuc_probs(PNUC_NNK_LXA)
 
+
 def get_entropy(p_lxa, normalize: bool = False):
     """
     Calculates entropy from normalized probabilities of site-wise categorical distributions.
@@ -173,7 +179,7 @@ def get_entropy(p_lxa, normalize: bool = False):
     H = -np.sum(p_ma_lxa * logp_lxa)
     return H
 
-# TODO: can delete, just convenient for debugging
+
 def fit_mle_paa(aaohe_nxlxa: np.array, weight_n: np.array = None):
     if weight_n is None:
         weight_n = np.ones([aaohe_nxlxa.shape[0]])
@@ -181,7 +187,8 @@ def fit_mle_paa(aaohe_nxlxa: np.array, weight_n: np.array = None):
     paa_lxa = counts_lxa / np.sum(counts_lxa, axis=1, keepdims=True)
     return paa_lxa
 
-def get_expected_pairwise_distance(pnuc_lxa, normalize: bool = False):  # TODO: test
+
+def get_expected_pairwise_distance(pnuc_lxa, normalize: bool = False): 
     """
     Calculates the expected pairwise distance between amino acid sequences
     given the site-wise nucleotide categorical distributions.
@@ -192,10 +199,12 @@ def get_expected_pairwise_distance(pnuc_lxa, normalize: bool = False):  # TODO: 
     epd = paa_lxa.shape[0] - np.sum(np.square(paa_lxa))
     return epd
 
+
 def get_nostop_normalizing_constant(logp_lxa: np.array):
     alllogp_n = get_loglikelihood(ALL_NOSTOP_AA_OHE, logp_lxa)
     allp_n = np.exp(alllogp_n)
     return np.sum(allp_n)
+
 
 def get_nostop_loglikelihood(ohe_nxlxa: np.array, p_lxa: np.array):
     """
@@ -207,12 +216,14 @@ def get_nostop_loglikelihood(ohe_nxlxa: np.array, p_lxa: np.array):
     logp_withstop_n = get_loglikelihood(ohe_nxlxa, logp_lxa)
     return logp_withstop_n - np.log(normalizing_const)
 
+
 def get_loglikelihood(ohe_nxlxa: np.array, logp_lxa: np.array):
     """
     Calculates the log-probability of OHE sequences given the log-probabiliies of site-wise categorical distributions.
     """
     logp_n = np.sum(ohe_nxlxa * logp_lxa[None, :, :], axis=(1, 2), keepdims=False)
     return logp_n
+
 
 def solve_max_entropy_library(
     model: EnrichmentFeedForward,
@@ -324,14 +335,10 @@ def select_for_mean_without_labeled_data(
     trainseq_n,
     ytrain_n: np.array,
     n_design: int = 1000000,
-    save_path: str = '/data/wongfanc/gb1-results',
     po_csv_fname: str = None,
     gmm_csv_fname: str = None,
     n_gmm_designs: int = 10000,
     gmm_qs = None,
-    design_samples_fname_prefix: str = 'gb1-h10-10k-051324-samples',
-    load_design_samples: bool = True,
-    save_design_samples: bool = False
 ):
     
     if po_csv_fname is not None:
@@ -355,12 +362,6 @@ def select_for_mean_without_labeled_data(
     # predictions on training data and edit distance from WT for Wheelock forecasts
     predtrain_n = model.predict(trainseq_n)
     trained_n = np.array([editdistance.eval(WT_GB1, seq) for seq in trainseq_n])
-
-    if load_design_samples and save_design_samples:
-        raise ValueError('Only one of load_design_samples or save_design_samples can be True.') 
-    if load_design_samples or save_design_samples:
-        if design_samples_fname_prefix is None:
-            raise ValueError('Provide design_samples_fname_prefix.')
         
     print('Selection quantity is the mean label.')
     print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(np.min(desired_values), np.max(desired_values)))
@@ -371,31 +372,15 @@ def select_for_mean_without_labeled_data(
 
         for i in range(n_trial):
 
-            # sampling design sequences is bottleneck, load pre-sampled
-            if load_design_samples:
-                design_samples_fname = os.path.join(save_path, '{}-t{:.4f}-{}.npz'.format(design_samples_fname_prefix, temp, i))
-                d = np.load(design_samples_fname)
-                designohe_nxlxa = d['designohe_nxlxa']
-                designed_n = d['designed_n']
-                if designohe_nxlxa.shape[0] != n_design:
-                    raise ValueError('Loaded {} != n_design = {} design sequences from {}.'.format(
-                        designohe_nxlxa.shape[0], n_design, design_samples_fname
-                    ))
-                print('Loaded {} design sequences from {}.'.format(n_design, design_samples_fname))
-            else:
-                # sample unlabeled sequences from design distribution
-                _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
-                    theta_lxa, n_design, normalize=True, reject_stop_codon=True
-                )
-                designseq_N = ohes2strs(designohe_nxlxa, AA)  # TODO: memory probably can't handle all of this
-                designed_n = np.array([editdistance.eval(WT_GB1, seq) for seq in designseq_N])
-                print('Sampled {} design sequences using temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
-                if save_design_samples:
-                    design_samples_fname = os.path.join(save_path, '{}-t{:.4f}-{}.npz'.format(design_samples_fname_prefix, temp, i))
-                    np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
-                    print('Saved design samples to {}.'.format(design_samples_fname))
+            # ===== sample designs =====
+            _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
+                theta_lxa, n_design, normalize=True, reject_stop_codon=True
+            )
+            designseq_N = ohes2strs(designohe_nxlxa, AA)
+            designed_n = np.array([editdistance.eval(WT_GB1, seq) for seq in designseq_N])
+            print('Sampled {} design sequences using temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
                 
-            # predictions for unlabeled design sequences
+            # predictions for designs
             preddesign_n = model.predict(designohe_nxlxa)
             po_mean = np.mean(preddesign_n)
             po_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
@@ -450,12 +435,8 @@ def select_for_mean_with_labeled_data(
     n_design_forecasts: int = 1000,
     tol: float = 0.01,
     quad_limit: int = 1000,
-    save_path: str = '/data/wongfanc/gb1-results',
     pp_csv_fname: str = None,
     cal_csv_fname: str = None,
-    design_samples_fname_prefix: str = 'gb1-h10-5k-030123-samples',
-    load_design_samples: bool = True,
-    save_design_samples: bool = False
 ):
     
     # standardize temperatures and desired values (tau)
@@ -470,40 +451,18 @@ def select_for_mean_with_labeled_data(
 
     if pp_csv_fname is not None:
         assert(cal_csv_fname is not None)
-
-    if load_design_samples and save_design_samples:
-        raise ValueError('Only one of load_design_samples or save_design_samples can be True.') 
-    if load_design_samples or save_design_samples:
-        if design_samples_fname_prefix is None:
-            raise ValueError('Provide design_samples_fname_prefix.')
-        
+    
     print('Selection quantity is the mean label.')
     print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(np.min(desired_values), np.max(desired_values)))
 
     t0 = time()
     for t, (temp, theta_lxa) in enumerate(temp2theta.items()):
 
-        # ----- load or sample designs -----
-        if load_design_samples:
-            design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
-            d = np.load(design_samples_fname)
-            designohe_nxlxa = d['designohe_nxlxa']
-            if designohe_nxlxa.shape[0] != n_design:
-                raise ValueError('Loaded {} != n_design = {} design sequences from {}.'.format(
-                    designohe_nxlxa.shape[0], n_design, design_samples_fname
-                ))
-            print('Loaded {} design sequences from {}.'.format(n_design, design_samples_fname))
-        else:
-            # sample unlabeled sequences from design distribution
-            _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
-                theta_lxa, n_design, normalize=True, reject_stop_codon=True
-            )
-            print('Sampled {} design sequences using temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
-            if save_design_samples:
-                design_samples_fname = os.path.join(save_path, '{}-t{:.4f}.npz'.format(design_samples_fname_prefix, temp))
-                np.savez(design_samples_fname, designohe_nxlxa=designohe_nxlxa)
-                print('Saved design samples to {}.'.format(design_samples_fname))
-            
+        # ===== sample designs =====
+        _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
+            theta_lxa, n_design, normalize=True, reject_stop_codon=True
+        )
+        print('Sampled {} design sequences using temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
 
         # ----- predictions for designs ----
         preddesign_Nxm = model.ensemble_predict(designohe_nxlxa)
@@ -564,7 +523,7 @@ def select_for_mean_with_labeled_data(
             ir.fit(calF_n, calempF_n)
 
             # subsample designs
-            calmu_N, t1_err, t2_err = utils.get_mean_from_cdf(
+            calmu_N, t1_err, t2_err = get_mean_from_cdf(
                 designmu_n,
                 designsigma_n,
                 ir,
