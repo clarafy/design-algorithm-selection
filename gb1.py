@@ -10,9 +10,8 @@ from pandas import DataFrame, read_csv
 from statsmodels.stats.weightstats import _zstat_generic
 from Bio.Seq import Seq
 
+import utils
 from models import EnrichmentFeedForward
-from utils import str2onehot, editdistance, ohes2strs, gmm_mean_forecast, rectified_p_value, get_mean_from_cdf
-
 
 # ===== constants =====
 
@@ -45,7 +44,7 @@ AA2IDX = {aa: idx for idx, aa in enumerate(AA)}
 
 AA_NOSTOP = ''.join([aa for aa in AA2CODON.keys() if aa != '*'])
 ALL_NOSTOP_AA_SEQS = [''.join(aas) for aas in product(*(4 *[AA_NOSTOP]))]
-ALL_NOSTOP_AA_OHE = np.stack([str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
+ALL_NOSTOP_AA_OHE = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
 WT_GB1 = 'vdgv'
 
 NUCLEOTIDES = 'atcg'
@@ -58,7 +57,6 @@ GB1_ALL_VAR = df['estimated_variance'].to_numpy()
 SEQ2YVAR = {seq: [y, var] for seq, y, var in zip(GB1_ALL_SEQS, GB1_ALL_Y, GB1_ALL_VAR)}
 assert(set(GB1_ALL_SEQS) == set(ALL_NOSTOP_AA_SEQS))
 
-DEFAULT_GMM_QS = [0, 0.5, 1]
 
 
 # ===== sampling sequences from design distributions q_\lambda =====
@@ -313,7 +311,7 @@ def get_true_mean_label_from_theta(temp2theta, threshold: float = None, verbose:
     if verbose:
         print('True mean for temperature...')
     t0 = time()
-    ohe_nxlxa = np.stack([str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
+    ohe_nxlxa = np.stack([utils.str2onehot(seq, AA) for seq in ALL_NOSTOP_AA_SEQS])
     for temp, theta_lxa in temp2theta.items():
         paa_lxa = get_aa_probs_from_nuc_probs(normalize_theta(theta_lxa))
         pdesign_n = np.exp(get_nostop_loglikelihood(ohe_nxlxa, paa_lxa))
@@ -347,7 +345,7 @@ def select_for_mean_without_labeled_data(
         assert(po_csv_fname is not None)
 
     if gmm_qs is None:
-        gmm_qs = DEFAULT_GMM_QS
+        gmm_qs = utils.DEFAULT_GMM_QS
         
     temperatures = [round(t, 4) for t in list(temp2theta.keys())]
     desired_values = np.array([round(v, 4) for v in desired_values])
@@ -361,7 +359,7 @@ def select_for_mean_without_labeled_data(
 
     # predictions on training data and edit distance from WT for Wheelock forecasts
     predtrain_n = model.predict(trainseq_n)
-    trained_n = np.array([editdistance.eval(WT_GB1, seq) for seq in trainseq_n])
+    trained_n = np.array([utils.editdistance.eval(WT_GB1, seq) for seq in trainseq_n])
         
     print('Selection quantity is the mean label.')
     print('Range of provided target values: [{:.3f}, {:.3f}].\n'.format(np.min(desired_values), np.max(desired_values)))
@@ -376,8 +374,8 @@ def select_for_mean_without_labeled_data(
             _, designohe_nxlxa, _ = sample_ohe_from_nuc_distribution(
                 theta_lxa, n_design, normalize=True, reject_stop_codon=True
             )
-            designseq_N = ohes2strs(designohe_nxlxa, AA)
-            designed_n = np.array([editdistance.eval(WT_GB1, seq) for seq in designseq_N])
+            designseq_N = utils.ohes2strs(designohe_nxlxa, AA)
+            designed_n = np.array([utils.editdistance.eval(WT_GB1, seq) for seq in designseq_N])
             print('Sampled {} design sequences using temperature {:.2f} ({} s).'.format(n_design, temp, int(time() - t0)))
                 
             # predictions for designs
@@ -386,20 +384,20 @@ def select_for_mean_without_labeled_data(
             po_se = np.std(preddesign_n) / np.sqrt(preddesign_n.size)
 
             # ===== PO =====
-            for target_val in desired_values:
+            for tau in desired_values:
                 po_pval = _zstat_generic(
                     po_mean,
                     0,
                     po_se,
                     alternative='larger',
-                    diff=target_val
+                    diff=tau
                 )[1]
-                po_df.loc[target_val]['tr{}_po_pval_temp{:.4f}'.format(i, temp)] = po_pval
+                po_df.loc[tau]['tr{}_po_pval_temp{:.4f}'.format(i, temp)] = po_pval
             
             # ===== GMMForecasts ===== 
             # subsample designs to avoid OOM
             samp_idx = np.random.choice(preddesign_n.size, size=(n_gmm_designs), replace=False)
-            designp_N, designped_N, q2functionalmus, designmuneg_N = gmm_mean_forecast(
+            designp_N, designped_N, q2functionalmus, designmuneg_N = utils.gmm_mean_forecast(
                 ytrain_n, predtrain_n, trained_n, preddesign_n[samp_idx], designed_n[samp_idx], qs=gmm_qs
             )
 
@@ -505,7 +503,7 @@ def select_for_mean_with_labeled_data(
 
             # ===== PP (our method) =====
             for tau in desired_values:
-                pp_pval = rectified_p_value(
+                pp_pval = utils.rectified_p_value(
                     rectifier_mean,
                     rectifier_se,
                     imputed_mean,
@@ -523,7 +521,7 @@ def select_for_mean_with_labeled_data(
             ir.fit(calF_n, calempF_n)
 
             # subsample designs
-            calmu_N, t1_err, t2_err = get_mean_from_cdf(
+            calmu_N, t1_err, t2_err = utils.get_mean_from_cdf(
                 designmu_n,
                 designsigma_n,
                 ir,
@@ -601,7 +599,7 @@ def process_gmmforecasts_for_plotting(
     gmm_qs = None,
 ):
     if gmm_qs is None:
-        gmm_qs = DEFAULT_GMM_QS
+        gmm_qs = utils.DEFAULT_GMM_QS
 
     q2results = {}
     for q in gmm_qs:

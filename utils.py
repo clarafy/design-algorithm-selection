@@ -6,10 +6,14 @@ import scipy as sc
 from statsmodels.stats.weightstats import _zstat_generic
 from sklearn.isotonic import IsotonicRegression
 from scipy.integrate import quad_vec
+import editdistance
 
 
 RNA_NUCLEOTIDES = 'UGCA'
 RNANUC2COMPLEMENT = {"A": "U", "C": "G", "G": "C", "U": "A"}
+
+# settings for GMMForecasts hyperparameter q
+DEFAULT_GMM_QS = [0, 0.5, 1]
 
 
 # ===== general biological sequence utilities =====
