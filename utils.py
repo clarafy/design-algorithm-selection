@@ -84,7 +84,7 @@ def calibrated_cdf_vec(y, predmu_n, predsigma_n, calibrator):
 def get_mean_from_cdf(
     predmu_n: np.array,
     predsigma_n: np.array,
-    calibrator, # maps CDF value to calibrated CDF value
+    calibrator,  # maps CDF value to calibrated CDF value
     positive_int_limits,
     negative_int_limits,
     quad_limit: int = 200,
@@ -101,6 +101,7 @@ def get_mean_from_cdf(
         )
     else:
         term1_n = np.zeros(predmu_n.shape)
+        term1_max_err = None
 
     if negative_int_limits is not None:
         assert(negative_int_limits[1] <= 0)
@@ -113,6 +114,7 @@ def get_mean_from_cdf(
         )
     else:
         term2_n = np.zeros(predmu_n.shape)
+        term2_max_err = None
 
     return term1_n - term2_n, term1_max_err, term2_max_err
     

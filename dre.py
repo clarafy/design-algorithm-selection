@@ -62,13 +62,13 @@ class MultiMDRE():
             if len(name2dd) == 1:
                 assert('train' in name2dd)
                 group_str = self.group_regex_strs[i]
-                raise ValueError('Group {} has no design algorithms in name2designdata.'.format(group_str))
+                raise ValueError('Group {} has no configurations in name2designdata.'.format(group_str))
 
         # fit MDRE per group
         for i, name2dd in idx2group.items():
             group_str = self.group_regex_strs[i]
             if verbose:
-                print('Fitting MDRE for {}, which has {} design algorithms:'.format(group_str, len(name2dd) - 1))
+                print('Fitting MDRE model for {}, a classifier between {} configurations:'.format(group_str, len(name2dd) - 1))
                 for name in name2dd:
                     print(name)
 

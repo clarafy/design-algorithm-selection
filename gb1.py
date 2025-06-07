@@ -5,7 +5,6 @@ from time import time
 
 import numpy as np
 import scipy as sc
-from sklearn.isotonic import IsotonicRegression
 from pandas import DataFrame, read_csv
 from statsmodels.stats.weightstats import _zstat_generic
 from Bio.Seq import Seq
@@ -431,7 +430,7 @@ def select_for_mean_with_labeled_data(
     n_design: int = 1000000,
     n_trial: int = 200,
     n_design_forecasts: int = 1000,
-    tol: float = 0.01,
+    # tol: float = 0.01,
     quad_limit: int = 1000,
     pp_csv_fname: str = None,
     cal_csv_fname: str = None,
@@ -513,11 +512,11 @@ def select_for_mean_with_labeled_data(
                 )
                 pp_df.loc[tau]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
 
-            # ===== calibrated forecasts method =====
+            # ===== CalibratedForecasts method =====
             calsigma_n = np.std(predcal_nxm, axis=1, keepdims=False)
             calF_n = sc.stats.norm.cdf(ycal_n, loc=predcal_n, scale=calsigma_n)
             calempF_n = np.mean(calF_n[:, None] <= calF_n[None, :], axis=0, keepdims=False)
-            ir = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
+            ir = utils.IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
             ir.fit(calF_n, calempF_n)
 
             # subsample designs
@@ -529,7 +528,7 @@ def select_for_mean_with_labeled_data(
                 (neg_int_limit, 0),
                 quad_limit=quad_limit,
                 err_norm='max',
-                tol=tol,
+                # tol=tol,
             )
             cal_df.loc[i, 'cal_mean_temp{:.4f}'.format(temp)] = np.mean(calmu_N)
                     
