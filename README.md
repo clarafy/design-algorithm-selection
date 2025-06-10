@@ -1,9 +1,11 @@
 # Design algorithm selection
-Repo accompanying the ICML 2025 submission "Reliable algorithm selection for machine learning-guided design".
+Repo accompanying the paper "Reliable algorithm selection for machine learning-guided design" (ICML 2025).
 
-See gb1-demo.ipynb for how to reproduce the algorithm selection experiments for designing protein GB1 (Fig. 3 in the main text). Descriptions of other files are as follows:
+See gb1-demo.ipynb and rna-demo.ipynb for how to reproduce the design algorithm selection experiments for protein GB1
+(Fig. 3) and RNA binders (Fig. 4), respectively, in the main text.  Descriptions of other files are as follows:
 - `gb1.py`: main functions for GB1 experiments
-- `utils.py`: utilities and other methods (GMMForecasts, CalibratedForecasts, and conformal prediction methods)
+- `rna.py`: main functions for RNA experiments
+- `utils.py`: utilities and other methods (GMMForecasts, CalibratedForecasts, conformal prediction methods)
 - `models.py`: classes for predictive models
 - `designers.py`: design algorithms used in RNA binder experiments
 - `vae.py`: VAE used by CbAS and DbAS in designers.py
