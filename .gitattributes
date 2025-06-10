@@ -10,3 +10,4 @@ rna-results/rna-designs-10kmodel-7.pkl filter=lfs diff=lfs merge=lfs -text
 rna-results/rna-designs-10kmodel-8.pkl filter=lfs diff=lfs merge=lfs -text
 rna-results/rna-designs-10kmodel-9.pkl filter=lfs diff=lfs merge=lfs -text
 rna-results/rna-designs-10kmodel-10.pkl filter=lfs diff=lfs merge=lfs -text
+rna-models/rna-heldout-5k.pkl filter=lfs diff=lfs merge=lfs -text
