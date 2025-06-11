@@ -247,7 +247,7 @@ def select_for_mean_without_labeled_data(
                     alternative='larger',
                     diff=tau
                 )[1]
-                po_df.loc[tau]['tr{}_po_pval_{}'.format(i, design_name)] = po_pval
+                po_df.loc[tau, 'tr{}_po_pval_{}'.format(i, design_name)] = po_pval
 
             # ===== GMMForecasts =====
             # get predictive model used by this configuration,
@@ -273,12 +273,12 @@ def select_for_mean_without_labeled_data(
             for q, (designmutilde_N, designmued_N) in q2functionalmus.items():
                 # w/o correction for covariate shift
                 forecast_tilde = np.mean(designp_N * designmutilde_N + (1 - designp_N) * designmuneg_N)
-                gmm_df.loc[i]['gmm-q{:.2f}_mean_{}'.format(q, design_name)] = forecast_tilde
+                gmm_df.loc[i, 'gmm-q{:.2f}_mean_{}'.format(q, design_name)] = forecast_tilde
 
                 # w/ correction to p and \tilde{\mu} for covariate shift,
                 # based on edit distance to the seed sequence
                 forecast_ed = np.mean(designped_N * designmued_N + (1 - designped_N) * designmuneg_N)
-                gmm_df.loc[i]['gmm-cs-q{:.2f}_mean_{}'.format(q, design_name)] = forecast_ed
+                gmm_df.loc[i, 'gmm-cs-q{:.2f}_mean_{}'.format(q, design_name)] = forecast_ed
             
         print('Done with trial {} / {} ({} s).'.format(i + 1, n_trial, int(time() - t0)))
     
@@ -442,7 +442,7 @@ def select_for_mean_with_labeled_data(
                     null=val,
                     alternative='larger'
                 )
-                pp_df.loc[val]['tr{}_pp_pval_{}'.format(t, design_name)] = pp_pval
+                pp_df.loc[val, 'tr{}_pp_pval_{}'.format(t, design_name)] = pp_pval
             
             # ===== CalibratedForecasts method =====
             # subsample designs for speed
@@ -509,8 +509,8 @@ def process_pvalues_for_plotting(
         worst_t = []  # worst (i.e. lowest) mean label for trials where a configuration was selected
         
         for i in range(n_trial):
-            selected = [name for name in design_names if df.loc[val]['tr{}_{}_pval_{}'.format(i, method_name, name)] < alpha_bonferroni]
-            achieved = [truemeans_df.loc[name]['mean_design_label'] for name in selected]
+            selected = [name for name in design_names if df.loc[val, 'tr{}_{}_pval_{}'.format(i, method_name, name)] < alpha_bonferroni]
+            achieved = [truemeans_df.loc[name, 'mean_design_label'] for name in selected]
 
             if len(selected):
                 worst_t.append(np.min(achieved))
@@ -570,7 +570,7 @@ def process_forecasts_for_plotting(
             val2selected[val].append([])
 
         for name in design_names:
-            forecast = df.loc[i]['{}_mean_{}'.format(method_name, name)]
+            forecast = df.loc[i, '{}_mean_{}'.format(method_name, name)]
 
             for val in desired_values:
                 if forecast >= val:
@@ -582,7 +582,7 @@ def process_forecasts_for_plotting(
     for val in desired_values:                    
         worst_t = []    # worst (i.e. lowest) mean design label for each trial
         for i in range(n_trial):
-            achieved = [truemeans_df.loc[name]['mean_design_label'] for name in val2selected[val][i]]
+            achieved = [truemeans_df.loc[name, 'mean_design_label'] for name in val2selected[val][i]]
             if len(achieved):
                 worst_t.append(np.min(achieved))
                 
