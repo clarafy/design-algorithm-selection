@@ -391,7 +391,7 @@ def select_for_mean_without_labeled_data(
                     alternative='larger',
                     diff=tau
                 )[1]
-                po_df.loc[tau]['tr{}_po_pval_temp{:.4f}'.format(i, temp)] = po_pval
+                po_df.loc[tau, 'tr{}_po_pval_temp{:.4f}'.format(i, temp)] = po_pval
             
             # ===== GMMForecasts ===== 
             # subsample designs to avoid OOM
@@ -404,12 +404,12 @@ def select_for_mean_without_labeled_data(
             for q, (designmutilde_N, designmued_N) in q2functionalmus.items():
                 # w/o correction for covariate shift
                 forecast_tilde = np.mean(designp_N * designmutilde_N + (1 - designp_N) * designmuneg_N)
-                gmm_df.loc[i]['gmm-q{:.2f}_mean_temp{:.4f}'.format(q, temp)] = forecast_tilde
+                gmm_df.loc[i, 'gmm-q{:.2f}_mean_temp{:.4f}'.format(q, temp)] = forecast_tilde
 
                 # w/ correction to p and \tilde{\mu} for covariate shift,
                 # based on edit distance to the seed sequence
                 forecast_ed = np.mean(designped_N * designmued_N + (1 - designped_N) * designmuneg_N)
-                gmm_df.loc[i]['gmm-cs-q{:.2f}_mean_temp{:.4f}'.format(q, temp)] = forecast_ed
+                gmm_df.loc[i, 'gmm-cs-q{:.2f}_mean_temp{:.4f}'.format(q, temp)] = forecast_ed
     
         print('Done with temperature {:.4f} ({} / {}) ({} s)'.format(
             temp, t + 1, len(temperatures), int(time() - t0))
@@ -510,7 +510,7 @@ def select_for_mean_with_labeled_data(
                     null=tau,
                     alternative='larger'
                 )
-                pp_df.loc[tau]['tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
+                pp_df.loc[tau, 'tr{}_pp_pval_temp{:.4f}'.format(i, temp)] = pp_pval
 
             # ===== CalibratedForecasts method =====
             calsigma_n = np.std(predcal_nxm, axis=1, keepdims=False)
@@ -575,7 +575,7 @@ def process_pvalues_for_plotting(
         worst_t = []  # worst (i.e. lowest) mean label for trials where a temperature was selected
         
         for i in range(n_trial):
-            selected = [temp for temp in temperatures if df.loc[val]['tr{}_{}_pval_temp{:.4f}'.format(i, method_name, temp)] < alpha_bonferroni]
+            selected = [temp for temp in temperatures if df.loc[val, 'tr{}_{}_pval_temp{:.4f}'.format(i, method_name, temp)] < alpha_bonferroni]
             achieved = [temp2mean[round(t, 4)] for t in selected]
 
             if len(selected):
@@ -627,7 +627,7 @@ def process_forecasts_for_plotting(
             val2selected[val].append([])
 
         for temp in temperatures:
-            forecast = df.loc[i]['{}_mean_temp{:.4f}'.format(method_name, temp)]
+            forecast = df.loc[i, '{}_mean_temp{:.4f}'.format(method_name, temp)]
 
             for val in desired_values:
                 if forecast >= val:
