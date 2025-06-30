@@ -21,3 +21,11 @@ Descriptions of other files are as follows:
 - `designers.py`: design algorithms used in RNA binder experiments
 - `vae.py`: VAE used by CbAS and DbAS in designers.py
 - `dre.py`: classes for density ratio estimation used in RNA binder experiments
+
+## Acknowledgments
+
+The RNA binder experiments use the [ViennaRNA](https://www.tbi.univie.ac.at/RNA/#) package, developed at the Institute for Theoretical Chemistry of the University of Vienna.
+
+Lorenz, Ronny and Bernhart, Stephan H. and Höner zu Siederdissen, Christian and Tafer, Hakim and Flamm, Christoph and Stadler, Peter F. and Hofacker, Ivo L.
+ViennaRNA Package 2.0
+Algorithms for Molecular Biology, 6:1 26, 2011, doi:10.1186/1748-7188-6-26
