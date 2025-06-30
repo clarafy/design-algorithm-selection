@@ -26,6 +26,13 @@ Descriptions of other files are as follows:
 
 The RNA binder experiments use the [ViennaRNA](https://www.tbi.univie.ac.at/RNA/#) package, developed at the Institute for Theoretical Chemistry of the University of Vienna.
 
-Lorenz, Ronny and Bernhart, Stephan H. and Höner zu Siederdissen, Christian and Tafer, Hakim and Flamm, Christoph and Stadler, Peter F. and Hofacker, Ivo L.
-ViennaRNA Package 2.0
-Algorithms for Molecular Biology, 6:1 26, 2011, doi:10.1186/1748-7188-6-26
+    @article{lorenz2011,
+    title    = "{ViennaRNA} Package 2.0",
+    author   = "Lorenz, Ronny and Bernhart, Stephan H and Höner Zu Siederdissen,
+                Christian and Tafer, Hakim and Flamm, Christoph and Stadler, Peter
+                F and Hofacker, Ivo L",
+    journal  = "Algorithms Mol. Biol.",
+    volume   =  6,
+    pages    =  26,
+    year     =  2011,
+    }
